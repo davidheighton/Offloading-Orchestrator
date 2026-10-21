@@ -3,6 +3,17 @@ const defaultModel = "qwen3.5:9b";
 const defaultTimeoutMs = 600000;
 const maxTimeoutMs = 900000;
 
+function getOllamaModel(value = process.env.OLLAMA_MODEL) {
+    if (value === undefined || value === "") return defaultModel;
+    if (typeof value !== "string") throw new Error("Ollama model must be a non-empty model tag.");
+
+    const model = value.trim();
+    if (!model || model.length > 256 || /[\u0000-\u001f]/.test(model)) {
+        throw new Error("Ollama model must be a non-empty model tag of at most 256 characters.");
+    }
+    return model;
+}
+
 function getOllamaTimeoutMs(value = process.env.OLLAMA_TIMEOUT_MS) {
     if (value === undefined || value === "") return defaultTimeoutMs;
 
@@ -24,6 +35,9 @@ function getOllamaBaseUrl(value = process.env.OLLAMA_HOST || defaultBaseUrl) {
     if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) {
         throw new Error("Ollama URL must use a loopback Ollama URL.");
     }
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+        throw new Error("Ollama URL must be a loopback origin without a path, query, or credentials.");
+    }
 
     return url.origin;
 }
@@ -34,7 +48,7 @@ async function run(message, options = {}) {
     }
 
     const baseUrl = getOllamaBaseUrl(options.baseUrl);
-    const model = options.model || process.env.OLLAMA_MODEL || defaultModel;
+    const model = getOllamaModel(options.model ?? process.env.OLLAMA_MODEL);
     const fetchImpl = options.fetchImpl || fetch;
     const timeoutMs = getOllamaTimeoutMs(options.timeoutMs);
     let response;
@@ -59,7 +73,16 @@ async function run(message, options = {}) {
     }
 
     if (!response.ok) {
-        throw new Error(`Ollama returned HTTP ${response.status}.`);
+        let errorDetail;
+        try {
+            const errorResponse = await response.json();
+            if (typeof errorResponse?.error === "string" && errorResponse.error.trim()) {
+                errorDetail = errorResponse.error.trim();
+            }
+        } catch {
+            errorDetail = undefined;
+        }
+        throw new Error(`Ollama returned HTTP ${response.status}${errorDetail ? `: ${errorDetail}` : "."}`);
     }
 
     let result;
@@ -75,4 +98,4 @@ async function run(message, options = {}) {
     return result.message.content.trim();
 }
 
-module.exports = { getOllamaBaseUrl, getOllamaTimeoutMs, run };
+module.exports = { getOllamaBaseUrl, getOllamaModel, getOllamaTimeoutMs, run };

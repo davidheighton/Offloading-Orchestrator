@@ -563,12 +563,31 @@ test("Ollama rejects non-loopback endpoints", async () => {
     );
 });
 
+test("Ollama rejects base URLs that would be silently normalized", () => {
+    for (const baseUrl of [
+        "http://127.0.0.1:11434/api",
+        "http://user:pass@127.0.0.1:11434",
+        "http://127.0.0.1:11434?proxy=true",
+        "http://127.0.0.1:11434#chat"
+    ]) {
+        assert.throws(() => ollama.getOllamaBaseUrl(baseUrl), /loopback origin without a path/);
+    }
+});
+
 test("Ollama timeout is configurable within a bounded range", () => {
     assert.equal(ollama.getOllamaTimeoutMs(""), 600000);
     assert.equal(ollama.getOllamaTimeoutMs("300000"), 300000);
     assert.throws(() => ollama.getOllamaTimeoutMs("999"), /between 1000 and 900000/);
     assert.throws(() => ollama.getOllamaTimeoutMs("900001"), /between 1000 and 900000/);
     assert.throws(() => ollama.getOllamaTimeoutMs("not-a-number"), /between 1000 and 900000/);
+});
+
+test("Ollama model configuration defaults safely and rejects invalid tags", () => {
+    assert.equal(ollama.getOllamaModel(""), "qwen3.5:9b");
+    assert.equal(ollama.getOllamaModel("  qwen2.5-coder:7b  "), "qwen2.5-coder:7b");
+    assert.throws(() => ollama.getOllamaModel("   "), /non-empty model tag/);
+    assert.throws(() => ollama.getOllamaModel("x".repeat(257)), /at most 256 characters/);
+    assert.throws(() => ollama.getOllamaModel("qwen\n3.5"), /non-empty model tag/);
 });
 
 test("Ollama reports request timeouts with the configured duration", async () => {
@@ -604,6 +623,30 @@ test("Ollama reports HTTP status even when an error body is not JSON", async () 
             fetchImpl: async () => ({ ok: false, status: 503, json: async () => { throw new Error("not JSON"); } })
         }),
         /Ollama returned HTTP 503/
+    );
+});
+
+test("Ollama preserves structured HTTP error details", async () => {
+    await assert.rejects(
+        ollama.run("Local request", {
+            fetchImpl: async () => Response.json({ error: "model qwen3.5:9b not found" }, { status: 404 })
+        }),
+        /Ollama returned HTTP 404: model qwen3\.5:9b not found/
+    );
+});
+
+test("Ollama rejects malformed JSON and empty successful responses", async () => {
+    await assert.rejects(
+        ollama.run("Local request", {
+            fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error("invalid"); } })
+        }),
+        /Ollama returned invalid JSON/
+    );
+    await assert.rejects(
+        ollama.run("Local request", {
+            fetchImpl: async () => Response.json({ message: { content: "  " } })
+        }),
+        /Ollama returned an empty response/
     );
 });
 
