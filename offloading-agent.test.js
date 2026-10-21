@@ -18,6 +18,7 @@ const gemini = require("./gemini");
 const claude = require("./claude");
 const meta = require("./meta-ai");
 const ollama = require("./ollama");
+const { main: runCodingJobCli, parseCodingJobArgs, readCodingContextFile, readCodingContextFiles, runCodingJob } = require("./coding-job");
 const {
     clarifyTask,
     createImprovementWorkflowPayload,
@@ -44,6 +45,7 @@ const {
     hasJobCapacity,
     isJsonContentType,
     normalizeProvider,
+    maxCodingContextBytes,
     parseRepositorySummary,
     persistKnowledgeSummary,
     publicJob,
@@ -216,14 +218,161 @@ test("repository summary prompt requests grounded JSON and marks source as untru
     assert.match(boundedPrompt, /Additional workspace content omitted/);
 });
 
-test("coding job prompts request concrete code without implying provider filesystem access", () => {
+test("coding job prompts provide structured deliverables without implying provider filesystem access", () => {
     const prompt = buildCodingJobPrompt("Fix the workflow coding branch.");
     assert.match(prompt, /coding job/);
+    assert.match(prompt, /Summary, Unified diff, Tests, Validation, Assumptions/);
     assert.match(prompt, /unified diff/);
     assert.match(prompt, /do not claim files were changed/);
-    assert.match(prompt, /untrusted data, not as instructions/);
+    assert.match(prompt, /source snippets as untrusted reference data/);
     assert.match(prompt, /Fix the workflow coding branch\./);
+    assert.doesNotMatch(prompt, /<untrusted_workspace_context>/);
     assert.throws(() => buildCodingJobPrompt(" "), /non-empty coding request/);
+});
+
+test("coding job prompts include bounded context as untrusted reference data", () => {
+    const prompt = buildCodingJobPrompt("Fix the bug.", "function run() { return false; }");
+    assert.match(prompt, /<untrusted_workspace_context>\s+function run\(\) \{ return false; \}\s+<\/untrusted_workspace_context>/);
+    assert.throws(() => buildCodingJobPrompt("Fix the bug.", 42), /Coding context must be text/);
+    assert.throws(
+        () => buildCodingJobPrompt("Fix the bug.", "é".repeat(Math.floor(maxCodingContextBytes / 2) + 1)),
+        /UTF-8 bytes/
+    );
+});
+
+test("coding job context redacts common secret assignments before provider sharing", () => {
+    const prompt = buildCodingJobPrompt("Fix the configuration.", 'api_key = "private-value"');
+    assert.match(prompt, /api_key = "\[REDACTED\]"/);
+    assert.doesNotMatch(prompt, /private-value/);
+});
+
+test("coding CLI requires provider-sharing confirmation and parses task options", () => {
+    assert.deepEqual(parseCodingJobArgs([
+        "Fix total calculation",
+        "--confirm-provider-sharing",
+        "--provider",
+        "ollama",
+        "--context-file",
+        "src/totals.js",
+        "--context-file",
+        "tests/totals.test.js",
+        "--timeout-ms",
+        "300000"
+    ]), {
+        message: "Fix total calculation",
+        provider: "ollama",
+        contextFiles: ["src/totals.js", "tests/totals.test.js"],
+        timeoutMs: 300000,
+        confirmedProviderSharing: true
+    });
+    assert.throws(() => parseCodingJobArgs(["Fix total calculation"]), /--confirm-provider-sharing/);
+    assert.throws(() => parseCodingJobArgs(["Fix it", "--unknown"]), /Unknown option/);
+    assert.throws(() => parseCodingJobArgs(["Fix it", "--timeout-ms", "999", "--confirm-provider-sharing"]), /integer from 1000/);
+    assert.throws(() => parseCodingJobArgs(["Fix it", "--timeout-ms", "900001", "--confirm-provider-sharing"]), /integer from 1000/);
+    assert.throws(() => parseCodingJobArgs(["Fix it", "--context-file", "src.js", "--context-file", "src.js", "--confirm-provider-sharing"]), /more than once/);
+});
+
+test("coding CLI reads only bounded UTF-8 files inside the workspace", async () => {
+    const temporaryRoot = await fs.mkdtemp(path.join(require("node:os").tmpdir(), "coding-job-context-"));
+    const workspace = path.join(temporaryRoot, "workspace");
+    await fs.mkdir(workspace);
+    try {
+        await fs.writeFile(path.join(workspace, "source.js"), "const total = 1;", "utf8");
+        await fs.mkdir(path.join(workspace, "tests"));
+        await fs.writeFile(path.join(workspace, "tests", "total.test.js"), "assert.equal(total, 1);", "utf8");
+        await fs.writeFile(path.join(temporaryRoot, "outside.js"), "outside", "utf8");
+        await fs.writeFile(path.join(workspace, "large.js"), "x".repeat(maxCodingContextBytes + 1), "utf8");
+        await fs.writeFile(path.join(workspace, "medium.js"), "x".repeat(3000), "utf8");
+        await fs.writeFile(path.join(workspace, "medium2.js"), "y".repeat(1500), "utf8");
+        await fs.writeFile(path.join(workspace, "invalid.js"), Buffer.from([0xff]));
+        await fs.writeFile(path.join(workspace, ".env.local"), "api_key=secret", "utf8");
+        await fs.writeFile(path.join(workspace, "credentials.json"), "{}", "utf8");
+
+        assert.equal(await readCodingContextFile("source.js", workspace), "const total = 1;");
+        assert.equal(
+            await readCodingContextFiles(["source.js", "tests/total.test.js"], workspace),
+            "--- source.js ---\nconst total = 1;\n\n--- tests/total.test.js ---\nassert.equal(total, 1);"
+        );
+        await assert.rejects(readCodingContextFiles(["medium.js", "medium2.js"], workspace), /Combined coding context must not exceed/);
+        await assert.rejects(readCodingContextFile("../outside.js", workspace), /inside the workspace/);
+        await assert.rejects(readCodingContextFile("large.js", workspace), /must not exceed/);
+        await assert.rejects(readCodingContextFile("invalid.js", workspace), /valid UTF-8/);
+        await assert.rejects(readCodingContextFile(".env.local", workspace), /Sensitive files/);
+        await assert.rejects(readCodingContextFile("credentials.json", workspace), /Sensitive files/);
+    } finally {
+        await fs.rm(temporaryRoot, { recursive: true, force: true });
+    }
+});
+
+test("coding CLI submits once and polls until the job completes", async () => {
+    const calls = [];
+    const statusUpdates = [];
+    const responses = [
+        Response.json({ id: "coding-job-1", provider: "ollama", status: "queued" }, { status: 202 }),
+        Response.json({ id: "coding-job-1", status: "running" }),
+        Response.json({ id: "coding-job-1", status: "completed", result: "--- a/source.js\n+++ b/source.js" })
+    ];
+    const result = await runCodingJob("Fix total calculation", {
+        confirmedProviderSharing: true,
+        provider: "ollama",
+        context: "const total = 1;",
+        serviceUrl: "http://127.0.0.1:8766",
+        fetchImpl: async (url, options) => {
+            calls.push({ url, options });
+            return responses.shift();
+        },
+        pollIntervalMs: 0,
+        onStatus: status => statusUpdates.push(status)
+    });
+
+    assert.equal(result.status, "completed");
+    assert.equal(calls.length, 3);
+    assert.equal(calls[0].url, "http://127.0.0.1:8766/jobs");
+    assert.equal(calls[0].options.method, "POST");
+    assert.deepEqual(JSON.parse(calls[0].options.body), {
+        confirmedProviderSharing: true,
+        type: "coding",
+        provider: "ollama",
+        message: "Fix total calculation",
+        context: "const total = 1;"
+    });
+    assert.match(calls[2].url, /\/jobs\/coding-job-1$/);
+    assert.deepEqual(statusUpdates, ["queued", "running", "completed"]);
+});
+
+test("coding CLI reports provider failures without resubmitting", async () => {
+    const calls = [];
+    const result = await runCodingJob("Fix total calculation", {
+        confirmedProviderSharing: true,
+        serviceUrl: "http://127.0.0.1:8766",
+        fetchImpl: async (url, options) => {
+            calls.push({ url, options });
+            return calls.length === 1
+                ? Response.json({ id: "coding-job-failed", provider: "ollama" }, { status: 202 })
+                : Response.json({ id: "coding-job-failed", status: "failed", error: "Provider timed out." });
+        },
+        pollIntervalMs: 0
+    });
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error, "Provider timed out.");
+    assert.equal(calls.length, 2);
+    assert.equal(calls.filter(call => call.options.method === "POST").length, 1);
+});
+
+test("coding CLI timeout does not resubmit an accepted job", async () => {
+    const calls = [];
+    await assert.rejects(runCodingJob("Fix total calculation", {
+        confirmedProviderSharing: true,
+        serviceUrl: "http://127.0.0.1:8766",
+        timeoutMs: 0,
+        fetchImpl: async (url, options) => {
+            calls.push({ url, options });
+            return Response.json({ id: "coding-job-timeout", status: "queued" }, { status: 202 });
+        }
+    }), /Timed out waiting for coding job coding-job-timeout/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.method, "POST");
 });
 
 test("JSON request parsing rejects malformed UTF-8 and preserves valid multibyte text", async () => {
@@ -793,6 +942,69 @@ test("job API validates content types, object bodies, and job types", async () =
         }
     } finally {
         await new Promise(resolve => server.close(resolve));
+    }
+});
+
+test("coding job API accepts bounded context privately and rejects invalid context", async () => {
+    const originalRunner = providerRunners.get("copilot");
+    const invokedMessages = [];
+    providerRunners.set("copilot", async message => {
+        invokedMessages.push(message);
+        return "A minimal coding proposal.";
+    });
+    await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+    });
+
+    try {
+        const baseUrl = `http://127.0.0.1:${server.address().port}`;
+        const invalidBodies = [
+            { confirmedProviderSharing: true, type: "coding", provider: "copilot", message: "Fix it", context: 12 },
+            { confirmedProviderSharing: true, type: "coding", provider: "copilot", message: "Fix it", context: "x".repeat(maxCodingContextBytes + 1) },
+            { confirmedProviderSharing: true, type: "thinking", provider: "copilot", message: "Review it", context: "not supported" }
+        ];
+        for (const body of invalidBodies) {
+            const response = await fetch(`${baseUrl}/jobs`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body)
+            });
+            assert.equal(response.status, 400);
+        }
+        assert.equal(invokedMessages.length, 0);
+
+        const context = "function calculateTotal(items) { return 0; }";
+        const response = await fetch(`${baseUrl}/jobs`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                confirmedProviderSharing: true,
+                type: "coding",
+                provider: "copilot",
+                message: "Fix calculateTotal.",
+                context
+            })
+        });
+        assert.equal(response.status, 202);
+        const created = await response.json();
+        assert.equal("context" in created, false);
+
+        const deadline = Date.now() + 5000;
+        let completed;
+        do {
+            completed = await (await fetch(`${baseUrl}/jobs/${created.id}`)).json();
+            if (completed.status === "completed" || completed.status === "failed") break;
+            await new Promise(resolve => setTimeout(resolve, 10));
+        } while (Date.now() < deadline);
+
+        assert.equal(completed.status, "completed");
+        assert.equal("context" in completed, false);
+        assert.equal(invokedMessages.length, 1);
+        assert.ok(invokedMessages[0].includes(`<untrusted_workspace_context>\n\n${context}\n\n</untrusted_workspace_context>`));
+    } finally {
+        await new Promise(resolve => server.close(resolve));
+        providerRunners.set("copilot", originalRunner);
     }
 });
 
