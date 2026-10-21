@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Offloading Orchestrator</title>
+    <link rel="stylesheet" href="/dashboard.css">
+    <script src="/dashboard.js" defer></script>
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand-mark" aria-hidden="true">O</div>
+        <div class="brand-copy">
+            <p class="eyebrow">LOCAL CONTROL ROOM</p>
+            <h1>Offloading Orchestrator</h1>
+        </div>
+        <div class="connection" id="connection-state"><span class="connection-dot"></span><span>Connecting</span></div>
+    </header>
+
+    <main>
+        <section class="overview" aria-labelledby="overview-heading">
+            <div class="section-heading">
+                <div>
+                    <p class="eyebrow">LIVE OVERVIEW</p>
+                    <h2 id="overview-heading">Work in motion</h2>
+                </div>
+                <p class="updated" id="updated-at">Waiting for first refresh</p>
+            </div>
+            <div class="metrics" id="metrics" aria-live="polite">
+                <div class="metric"><span>Active jobs</span><strong>—</strong><small>queued + running</small></div>
+                <div class="metric"><span>Active workflows</span><strong>—</strong><small>across providers</small></div>
+                <div class="metric"><span>Completed, 24h</span><strong>—</strong><small>successful jobs</small></div>
+                <div class="metric accent"><span>Success rate, 24h</span><strong>—</strong><small>completed / terminal</small></div>
+            </div>
+            <div class="activity-strip" id="activity-strip" aria-live="polite"></div>
+        </section>
+
+        <section class="advice-section" aria-labelledby="advice-heading">
+            <div class="advice-intro">
+                <p class="eyebrow">FEATURE ADVICE</p>
+                <h2 id="advice-heading">Explore what to build next.</h2>
+                <p>Get a proposed implementation alongside independent architecture, test, and risk reviews grounded in a redacted summary of this workspace.</p>
+            </div>
+            <form id="advice-form">
+                <label for="feature-brief">Feature idea</label>
+                <textarea id="feature-brief" name="goal" maxlength="3500" rows="4" required placeholder="What should the orchestrator do, and what outcome would make it useful?"></textarea>
+                <p class="section-note">Providers use separate local browser profiles. Sign in once if a provider opens an authentication page.</p>
+                <div class="form-footer">
+                    <label class="consent">
+                        <input id="sharing-consent" type="checkbox" required>
+                        <span>I approve sending the redacted workspace summary and feature brief to ChatGPT, Gemini, Claude, and Meta AI for advice.</span>
+                    </label>
+                    <button id="submit-advice" type="submit"><span aria-hidden="true">↗</span> Request advice</button>
+                </div>
+                <p class="form-status" id="advice-status" role="status" aria-live="polite"></p>
+            </form>
+        </section>
+
+        <section class="provider-section" aria-labelledby="provider-heading">
+            <div class="section-heading compact">
+                <div><p class="eyebrow">CAPACITY & MIX</p><h2 id="provider-heading">Provider activity</h2></div>
+                <span class="section-note">Last 24 hours unless noted</span>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>Provider</th><th>Running</th><th>Queued</th><th>Done</th><th>Failed</th><th>Coding</th><th>Thinking</th><th>Availability</th></tr></thead>
+                        <tbody id="provider-rows"><tr><td colspan="8" class="empty">Loading provider activity…</td></tr></tbody>
+                </table>
+            </div>
+                <p class="form-status" id="provider-status" role="status" aria-live="polite">Offline settings last until the orchestrator restarts.</p>
+        </section>
+
+        <section class="work-section" aria-labelledby="work-heading">
+            <div class="section-heading compact">
+                <div><p class="eyebrow">RECENT ACTIVITY</p><h2 id="work-heading">Workflows & jobs</h2></div>
+                <span class="section-note">Latest 8 workflows · 12 jobs</span>
+            </div>
+            <div class="work-grid">
+                <div class="activity-column">
+                    <h3>Workflows</h3>
+                    <div id="workflow-list" class="activity-list"><p class="empty">No workflows yet.</p></div>
+                </div>
+                <div class="activity-column">
+                    <h3>Jobs</h3>
+                    <div class="table-scroll">
+                        <table class="jobs-table">
+                            <thead><tr><th>State</th><th>Provider</th><th>Type</th><th>Updated</th></tr></thead>
+                            <tbody id="job-rows"><tr><td colspan="4" class="empty">No jobs yet.</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div class="workflow-detail" id="workflow-detail" hidden></div>
+        </section>
+        <footer><span>Orchestrator memory resets when the service restarts.</span><span id="refresh-note">Refreshes every 5 seconds</span></footer>
+    </main>
+</body>
+</html>
