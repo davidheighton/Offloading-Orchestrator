@@ -5,6 +5,7 @@ const defaultServiceUrl = "http://127.0.0.1:8765";
 const maxGoalLength = 3500;
 const maxSummaryBytes = 5000;
 const pollIntervalMs = 2000;
+const serviceRequestTimeoutMs = 30000;
 const jobTimeoutMs = 15 * 60 * 1000;
 const workflowTimeoutMs = 30 * 60 * 1000;
 const clarificationJobTimeoutMs = 3 * 60 * 1000;
@@ -200,8 +201,21 @@ function createImprovementWorkflowPayload(goal, summary) {
     };
 }
 
-async function requestJson(fetchImpl, url, options) {
-    const response = await fetchImpl(url, options);
+async function requestJson(fetchImpl, url, options = {}, timeoutMs = serviceRequestTimeoutMs) {
+    let response;
+    try {
+        response = await fetchImpl(url, {
+            ...options,
+            signal: AbortSignal.timeout(timeoutMs)
+        });
+    } catch (error) {
+        if (error?.name === "TimeoutError") {
+            throw new Error(`Offloading service request timed out after ${timeoutMs} milliseconds.`, {
+                cause: error
+            });
+        }
+        throw error;
+    }
     let result;
     try {
         result = await response.json();
@@ -342,5 +356,6 @@ module.exports = {
     getServiceBaseUrl,
     parseClarificationResponse,
     maxClarificationQuestions,
+    requestJson,
     runImprovementAdvice
 };

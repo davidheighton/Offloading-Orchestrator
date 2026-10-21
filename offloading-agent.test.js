@@ -24,6 +24,7 @@ const {
     getServiceBaseUrl,
     maxClarificationQuestions,
     parseClarificationResponse,
+    requestJson,
     runImprovementAdvice
 } = require("./improvement-advisor");
 const {
@@ -559,6 +560,50 @@ test("Ollama rejects non-loopback endpoints", async () => {
     await assert.rejects(
         ollama.run("Local only", { baseUrl: "http://example.com:11434" }),
         /loopback Ollama URL/
+    );
+});
+
+test("Ollama timeout is configurable within a bounded range", () => {
+    assert.equal(ollama.getOllamaTimeoutMs(""), 600000);
+    assert.equal(ollama.getOllamaTimeoutMs("300000"), 300000);
+    assert.throws(() => ollama.getOllamaTimeoutMs("999"), /between 1000 and 900000/);
+    assert.throws(() => ollama.getOllamaTimeoutMs("900001"), /between 1000 and 900000/);
+    assert.throws(() => ollama.getOllamaTimeoutMs("not-a-number"), /between 1000 and 900000/);
+});
+
+test("Ollama reports request timeouts with the configured duration", async () => {
+    const timeoutError = new Error("The operation was aborted due to timeout");
+    timeoutError.name = "TimeoutError";
+
+    await assert.rejects(
+        ollama.run("Slow local request", {
+            timeoutMs: 120000,
+            fetchImpl: async () => { throw timeoutError; }
+        }),
+        /Ollama request timed out after 120000 milliseconds/
+    );
+});
+
+test("Ollama explains local connection failures and preserves the cause", async () => {
+    const connectionError = new TypeError("fetch failed");
+
+    await assert.rejects(
+        ollama.run("Local request", { fetchImpl: async () => { throw connectionError; } }),
+        error => {
+            assert.match(error.message, /Could not connect to local Ollama at http:\/\/127\.0\.0\.1:11434/);
+            assert.match(error.message, /Confirm the Ollama service is running/);
+            assert.equal(error.cause, connectionError);
+            return true;
+        }
+    );
+});
+
+test("Ollama reports HTTP status even when an error body is not JSON", async () => {
+    await assert.rejects(
+        ollama.run("Local request", {
+            fetchImpl: async () => ({ ok: false, status: 503, json: async () => { throw new Error("not JSON"); } })
+        }),
+        /Ollama returned HTTP 503/
     );
 });
 
@@ -1875,6 +1920,22 @@ test("clarification protocol parses vendor questions and completion responses", 
         { status: "ready", clarifiedTask: "Improve coding dispatch." }
     );
     assert.throws(() => parseClarificationResponse("not JSON"), /valid JSON/);
+});
+
+test("improvement service requests time out without resubmitting", async () => {
+    let requestCount = 0;
+    const fetchImpl = async (url, { signal }) => {
+        requestCount += 1;
+        return new Promise((resolve, reject) => {
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+    };
+
+    await assert.rejects(
+        requestJson(fetchImpl, "http://127.0.0.1:8766/workflows/slow", {}, 10),
+        /Offloading service request timed out after 10 milliseconds/
+    );
+    assert.equal(requestCount, 1);
 });
 
 test("improvement advice requires provider-sharing confirmation before any provider call", async () => {
