@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { createHash } = require("node:crypto");
 const test = require("node:test");
 const { createImprovementLoop, parseArguments } = require("./improvement-loop");
 
@@ -9,44 +10,194 @@ const validConfiguration = {
     confirmedProviderSharing: true,
     providers: ["claude", "gemini"],
     maxCycles: 3,
-    maxProviderCalls: 8,
+    maxProviderCalls: 15,
     maxSearches: 4,
     windowMinutes: 60
 };
+const workflowId = "7f7e39ec-60eb-42a2-810f-fb3b212c32ed";
+const proposalWorkflowId = "883a844d-c485-4be6-a249-8f7bf889f8e4";
+const candidateTestFilename = "improvement-loop.candidate.test.js";
+
+function makeCandidateDiff(sourceLines, filename = candidateTestFilename) {
+    return [
+        `diff --git a/${filename} b/${filename}`,
+        "new file mode 100644",
+        "--- /dev/null",
+        `+++ b/${filename}`,
+        `@@ -0,0 +1,${sourceLines.length} @@`,
+        ...sourceLines.map(line => `+${line}`)
+    ].join("\n");
+}
+
+function makeProposalResponse(diff, { tests = "Not run.", validation = "Not run." } = {}) {
+    return [
+        "## Summary",
+        "Adds a focused regression test for retry behavior.",
+        "## Unified diff",
+        "```diff",
+        diff,
+        "```",
+        "## Tests",
+        tests,
+        "## Validation",
+        validation,
+        "## Assumptions",
+        "The retry boundary is testable.",
+        "## Acceptance criteria",
+        "- The test detects an unintended second retry."
+    ].join("\n");
+}
+
+function jsonResponse(status, data) {
+    const text = JSON.stringify(data);
+    return {
+        status,
+        ok: status >= 200 && status < 300,
+        body: new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode(text));
+                controller.close();
+            }
+        }),
+        text: async () => text
+    };
+}
 
 function createFixture(options = {}) {
     const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "improvement-loop-"));
+    const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "improvement-loop-workspace-"));
     let currentTime = new Date("2025-01-01T00:00:00.000Z");
+    const calls = [];
+    const responses = [];
+    const fetchImpl = async (url, requestOptions) => {
+        calls.push({ url, options: requestOptions });
+        const response = responses.shift();
+        if (response === undefined) throw new Error("Unexpected service request.");
+        if (response instanceof Error) throw response;
+        return typeof response === "function" ? response(url, requestOptions) : response;
+    };
     const loop = createImprovementLoop({
         stateDirectory,
+        workspacePath: workspaceDirectory,
         now: () => new Date(currentTime),
+        fetchImpl,
         ...options
     });
     return {
         stateDirectory,
+        workspaceDirectory,
         loop,
+        calls,
+        restart() {
+            return createImprovementLoop({
+                stateDirectory,
+                workspacePath: workspaceDirectory,
+                now: () => new Date(currentTime),
+                fetchImpl,
+                ...options
+            });
+        },
+        respond(response) {
+            responses.push(response);
+        },
         setTime(value) {
             currentTime = new Date(value);
         },
         cleanup() {
             fs.rmSync(stateDirectory, { recursive: true, force: true });
+            fs.rmSync(workspaceDirectory, { recursive: true, force: true });
         }
     };
 }
 
-test("start records a bounded cloud-only run configuration", t => {
+const repositorySummary = {
+    summary: "A local Node.js service with provider workflows and an advice-only improvement controller.",
+    keyFiles: [{ path: "improvement-loop.js", role: "bounded controller" }],
+    entryPoints: ["offloading-agent.js"],
+    dependencies: ["playwright"],
+    risks: ["Provider workflow state is in memory."],
+    limitations: ["No patch application or scheduling."]
+};
+
+async function prepareSubmission(fixture) {
+    fixture.loop.start(validConfiguration);
+    fixture.respond(jsonResponse(200, { summary: repositorySummary }));
+    const result = await fixture.loop.tick();
+    assert.equal(result.phase, "ready-to-submit");
+    assert.equal(fixture.calls.length, 1);
+    return result;
+}
+
+async function submitWorkflow(fixture, status = 202) {
+    await prepareSubmission(fixture);
+    fixture.respond(jsonResponse(status, { id: workflowId, status: "queued" }));
+    return fixture.loop.tick();
+}
+
+async function completeAdvice(fixture) {
+    await submitWorkflow(fixture);
+    fixture.setTime("2025-01-01T00:00:15.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: workflowId,
+        status: "completed",
+        threads: [{ status: "completed", job: { provider: "claude", result: "branch advice" } }],
+        synthesis: { provider: "claude", result: "Add a regression test for the retry boundary." }
+    }));
+    return fixture.loop.tick();
+}
+
+async function completeProposal(fixture, codingResult) {
+    await completeAdvice(fixture);
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    await fixture.loop.tick();
+    fixture.setTime("2025-01-01T00:00:30.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: proposalWorkflowId,
+        status: "completed",
+        threads: [{
+            status: "completed",
+            job: { provider: "claude", type: "coding", result: codingResult }
+        }]
+    }));
+    return fixture.loop.tick();
+}
+
+function resealState(state) {
+    delete state.stateHash;
+    state.stateHash = createHash("sha256").update(JSON.stringify(state)).digest("hex");
+}
+
+test("start records bounded cloud-only provider advice authorization", t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
 
     const state = fixture.loop.start(validConfiguration);
 
     assert.equal(state.status, "configured");
-    assert.equal(state.cycleExecution, "not implemented");
-    assert.equal(state.budgetStatus, "configured, unused");
+    assert.equal(state.cycleExecution, "advice-and-proposal-only");
+    assert.equal(state.budgetStatus, "provider calls reserved; searches unused");
     assert.equal(state.authorizationHash.length, 64);
     assert.deepEqual(state.authorization.providers, ["claude", "gemini"]);
     assert.deepEqual(state.usage, { cycles: 0, providerCalls: 0, searches: 0, patches: 0 });
     assert.equal(state.tickCount, 0);
+});
+
+test("workspace changes during context collection prevent provider submission", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    fixture.loop.start(validConfiguration);
+    fixture.respond(() => {
+        fs.writeFileSync(path.join(fixture.workspaceDirectory, "changed.js"), "module.exports = true;\n");
+        return jsonResponse(200, { summary: repositorySummary });
+    });
+
+    const result = await fixture.loop.tick();
+
+    assert.equal(result.phase, "context");
+    assert.equal(result.contextFailures, 1);
+    assert.equal(result.lastErrorCode, "workspace-changed-during-context");
+    assert.equal(result.workspaceBase, null);
+    assert.equal(fixture.calls.length, 1);
 });
 
 test("start rejects unconfirmed, local, unknown, duplicate, and out-of-range authorization", t => {
@@ -61,6 +212,7 @@ test("start rejects unconfirmed, local, unknown, duplicate, and out-of-range aut
         { ...validConfiguration, maxCycles: 0 },
         { ...validConfiguration, maxCycles: 11 },
         { ...validConfiguration, maxProviderCalls: 0 },
+        { ...validConfiguration, maxProviderCalls: 4 },
         { ...validConfiguration, maxProviderCalls: 51 },
         { ...validConfiguration, maxSearches: 21 },
         { ...validConfiguration, windowMinutes: 4 },
@@ -83,55 +235,736 @@ test("a configured run cannot be overwritten until stopped or expired", t => {
     assert.equal(fixture.loop.start(validConfiguration).status, "configured");
 });
 
-test("ticks only advance bookkeeping and never consume configured work budgets", t => {
+test("advice advances to a bounded code proposal, which is stored but never applied", async t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
     fixture.loop.start(validConfiguration);
 
-    const first = fixture.loop.tick();
-    const second = fixture.loop.tick();
+    fixture.respond(jsonResponse(200, { summary: repositorySummary }));
+    const context = await fixture.loop.tick();
+    assert.equal(context.phase, "ready-to-submit");
+    assert.equal(fixture.calls.length, 1);
+    assert.match(fixture.calls[0].url, /repository-context$/);
+    assert.equal(fixture.calls[0].options.redirect, "error");
 
-    assert.equal(first.tickCount, 1);
-    assert.equal(second.tickCount, 2);
-    assert.equal(second.status, "configured");
-    assert.equal(second.cycleExecution, "not implemented");
-    assert.deepEqual(second.usage, { cycles: 0, providerCalls: 0, searches: 0, patches: 0 });
-    assert.match(second.message, /cycle execution is not implemented/);
+    fixture.respond(jsonResponse(202, { id: workflowId, status: "queued" }));
+    const submitted = await fixture.loop.tick();
+    assert.equal(submitted.phase, "polling");
+    assert.equal(submitted.usage.providerCalls, 3);
+    assert.equal(submitted.pendingProviderCalls, 3);
+    assert.equal(fixture.calls.length, 2);
+    const request = JSON.parse(fixture.calls[1].options.body);
+    assert.deepEqual(request.threads.map(thread => thread.provider), ["claude", "gemini"]);
+    assert.equal(request.synthesisProvider, "claude");
+    assert.ok(request.threads.every(thread => thread.type === "thinking" && !thread.required));
+    assert.ok(request.threads.every(thread => thread.prompt.length <= 7000));
+    assert.doesNotMatch(JSON.stringify(request), /\b(?:auto|ollama)\b/i);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.stateDirectory, "run-state.json"), "utf8"))
+        .authorization.providers.length, 2);
+
+    const deferredPoll = await fixture.loop.tick();
+    assert.match(deferredPoll.message, /deferred/);
+    assert.equal(fixture.calls.length, 2);
+
+    fixture.setTime("2025-01-01T00:00:15.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: workflowId,
+        status: "completed",
+        threads: [{ status: "completed", job: { provider: "claude", result: "branch advice" } }],
+        synthesis: { provider: "claude", result: "Add a regression test for the retry boundary." }
+    }));
+    const advice = await fixture.loop.tick();
+
+    assert.equal(advice.usage.cycles, 0);
+    assert.equal(advice.cycleStage, "proposal");
+    assert.equal(advice.phase, "ready-to-submit");
+    assert.equal(advice.adviceArtifact, "latest-advice.json");
+    assert.equal(fixture.calls.length, 3);
+
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    const proposalSubmission = await fixture.loop.tick();
+    assert.equal(proposalSubmission.phase, "polling");
+    assert.equal(proposalSubmission.cycleStage, "proposal");
+    assert.equal(proposalSubmission.pendingProviderCalls, 2);
+    assert.equal(proposalSubmission.usage.providerCalls, 5);
+    const proposalRequest = JSON.parse(fixture.calls[3].options.body);
+    assert.equal(proposalRequest.goal, "Create one test-only proposal for the prior reliability advice. Do not apply it, run commands, or claim validation.");
+    assert.equal(proposalRequest.synthesisProvider, "claude");
+    assert.deepEqual(proposalRequest.threads.map(thread => ({
+        type: thread.type,
+        provider: thread.provider,
+        required: thread.required
+    })), [{ type: "coding", provider: "claude", required: true }]);
+    assert.match(proposalRequest.threads[0].prompt, /Add a regression test for the retry boundary/);
+    assert.match(proposalRequest.threads[0].prompt, /exactly one new root file named improvement-loop\.candidate\.test\.js/);
+    assert.doesNotMatch(JSON.stringify(proposalRequest), /\b(?:auto|ollama)\b/i);
+
+    const deferredProposalPoll = await fixture.loop.tick();
+    assert.match(deferredProposalPoll.message, /deferred/);
+    assert.equal(fixture.calls.length, 4);
+
+    fixture.setTime("2025-01-01T00:00:30.000Z");
+    const proposedDiff = makeCandidateDiff(["test('retries once', () => {});"]).replace(/\n/g, "\r\n");
+    const proposalResponse = makeProposalResponse(proposedDiff);
+    fixture.respond(jsonResponse(200, {
+        id: proposalWorkflowId,
+        status: "completed",
+        threads: [{
+            status: "completed",
+            job: { provider: "claude", type: "coding", result: proposalResponse }
+        }],
+        synthesis: { provider: "claude", result: "Synthesis output is not the authoritative patch." }
+    }));
+    const completed = await fixture.loop.tick();
+
+    assert.equal(completed.usage.cycles, 1);
+    assert.equal(completed.usage.providerCalls, 5);
+    assert.equal(completed.phase, "context");
+    assert.equal(completed.cycleStage, "advice");
+    assert.equal(completed.workflowId, null);
+    assert.equal(completed.pendingProviderCalls, 0);
+    assert.equal(completed.proposalArtifact, "latest-proposal.json");
+    assert.match(completed.message, /not been validated or applied/);
+    assert.equal(fixture.calls.length, 5);
+    const stateText = fs.readFileSync(path.join(fixture.stateDirectory, "run-state.json"), "utf8");
+    assert.doesNotMatch(stateText, /Add a regression test|improvement-loop\.candidate\.test\.js/);
+    const adviceArtifact = JSON.parse(fs.readFileSync(path.join(fixture.stateDirectory, "latest-advice.json"), "utf8"));
+    assert.equal(adviceArtifact.selectedResult, "Add a regression test for the retry boundary.");
+    const proposalArtifact = JSON.parse(fs.readFileSync(path.join(fixture.stateDirectory, "latest-proposal.json"), "utf8"));
+    assert.equal(proposalArtifact.proposalText, proposedDiff.trim());
+    assert.equal(proposalArtifact.rationale, "Adds a focused regression test for retry behavior.");
+    assert.deepEqual(proposalArtifact.acceptanceCriteria, ["The test detects an unintended second retry."]);
+    assert.equal(proposalArtifact.testPlan, "Not run.");
+    assert.equal(proposalArtifact.assumptions, "The retry boundary is testable.");
+    assert.deepEqual({
+        schemaVersion: proposalArtifact.staticPreflight.schemaVersion,
+        status: proposalArtifact.staticPreflight.status,
+        reasonCode: proposalArtifact.staticPreflight.reasonCode,
+        target: proposalArtifact.staticPreflight.target,
+        addedLineCount: proposalArtifact.staticPreflight.addedLineCount
+    }, {
+        schemaVersion: 1,
+        status: "eligible-for-sandbox-review",
+        reasonCode: null,
+        target: candidateTestFilename,
+        addedLineCount: 1
+    });
+    assert.match(proposalArtifact.baseSnapshotHash, /^[a-f0-9]{64}$/);
+    assert.equal(proposalArtifact.staticPreflight.baseSnapshotHash, proposalArtifact.baseSnapshotHash);
+    assert.equal(proposalArtifact.staticPreflight.currentSnapshotHash, proposalArtifact.baseSnapshotHash);
+    assert.equal(proposalArtifact.schemaVersion, 1);
+    assert.equal(proposalArtifact.validated, false);
+    assert.equal(proposalArtifact.applied, false);
 });
 
-test("run state survives controller restarts", t => {
+test("sandbox-probe requires confirmation and transfers only the latest verified proposal", async t => {
+    let suppliedWorkspace;
+    let suppliedProposal;
+    let cleanupCalled = false;
+    const stagedWorkspace = {
+        status: "staged-unexecuted",
+        cleanup() {
+            cleanupCalled = true;
+        }
+    };
+    const fixture = createFixture({
+        sandboxWorkspaceFactory(options) {
+            suppliedWorkspace = options.workspacePath;
+            suppliedProposal = options.proposal;
+            assert.equal(options.stateDirectory, fixture.stateDirectory);
+            assert.equal(options.baseSnapshot.hash, suppliedProposal.baseSnapshotHash);
+            return stagedWorkspace;
+        },
+        sandboxTransferProbeFactory() {
+            return {
+                run(stage) {
+                    assert.equal(stage, stagedWorkspace);
+                    return {
+                        status: "passed",
+                        candidateCodeExecuted: false,
+                        workspaceMounted: false,
+                        checks: {
+                            stagedHashesVerifiedInContainer: true,
+                            networkDisabled: true,
+                            noHostMounts: true
+                        }
+                    };
+                }
+            };
+        }
+    });
+    t.after(fixture.cleanup);
+    await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"]))
+    );
+    const proposalPath = path.join(fixture.stateDirectory, "latest-proposal.json");
+    const proposalBytesBefore = fs.readFileSync(proposalPath);
+    const stateBytesBefore = fs.readFileSync(path.join(fixture.stateDirectory, "run-state.json"));
+
+    assert.throws(
+        () => fixture.loop.sandboxProbe(false),
+        /explicit confirmation/
+    );
+    const result = fixture.loop.sandboxProbe(true);
+
+    assert.equal(result.status, "passed");
+    assert.equal(result.candidateCodeExecuted, false);
+    assert.equal(result.workspaceMounted, false);
+    assert.equal(result.validated, false);
+    assert.equal(result.applied, false);
+    assert.equal(result.proposalWorkflowId, proposalWorkflowId);
+    assert.equal(suppliedWorkspace, fixture.workspaceDirectory);
+    assert.equal(suppliedProposal.validated, false);
+    assert.equal(cleanupCalled, true);
+    assert.deepEqual(fs.readFileSync(proposalPath), proposalBytesBefore);
+    assert.deepEqual(fs.readFileSync(path.join(fixture.stateDirectory, "run-state.json")), stateBytesBefore);
+    assert.equal(fixture.calls.length, 5);
+});
+
+test("sandbox-probe refuses stale or tampered proposal artifacts before staging", async t => {
+    let stageFactoryCalls = 0;
+    const fixture = createFixture({
+        sandboxWorkspaceFactory() {
+            stageFactoryCalls += 1;
+            throw new Error("Staging must not start for invalid inputs.");
+        }
+    });
+    t.after(fixture.cleanup);
+    await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"]))
+    );
+
+    fs.writeFileSync(path.join(fixture.workspaceDirectory, "changed.js"), "module.exports = true;\n");
+    assert.throws(
+        () => fixture.loop.sandboxProbe(true),
+        /no longer matches the live workspace snapshot/
+    );
+    assert.equal(stageFactoryCalls, 0);
+
+    fs.unlinkSync(path.join(fixture.workspaceDirectory, "changed.js"));
+    const proposalPath = path.join(fixture.stateDirectory, "latest-proposal.json");
+    const tamperedProposal = JSON.parse(fs.readFileSync(proposalPath, "utf8"));
+    tamperedProposal.rationale += " tampered";
+    fs.writeFileSync(proposalPath, JSON.stringify(tamperedProposal));
+    assert.throws(
+        () => fixture.loop.sandboxProbe(true),
+        /failed integrity validation/
+    );
+    assert.equal(stageFactoryCalls, 0);
+});
+
+test("sandbox-probe requires a complete non-execution attestation and still cleans staging", async t => {
+    let cleanupCalled = false;
+    const fixture = createFixture({
+        sandboxWorkspaceFactory() {
+            return { cleanup() { cleanupCalled = true; } };
+        },
+        sandboxTransferProbeFactory() {
+            return {
+                run() {
+                    return {
+                        status: "passed",
+                        candidateCodeExecuted: false,
+                        workspaceMounted: false,
+                        checks: { networkDisabled: true, noHostMounts: true }
+                    };
+                }
+            };
+        }
+    });
+    t.after(fixture.cleanup);
+    await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"]))
+    );
+
+    assert.throws(
+        () => fixture.loop.sandboxProbe(true),
+        /required non-execution attestation/
+    );
+    assert.equal(cleanupCalled, true);
+});
+
+test("proposal preflight rejects a workspace changed after context collection", async t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
-    fixture.loop.start(validConfiguration);
-    const restarted = createImprovementLoop({
-        stateDirectory: fixture.stateDirectory,
-        now: () => new Date("2025-01-01T00:00:00.000Z")
+    await completeAdvice(fixture);
+    const baseSnapshotHash = fixture.loop.status().workspaceBase.hash;
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    await fixture.loop.tick();
+    fs.writeFileSync(path.join(fixture.workspaceDirectory, "changed.js"), "module.exports = true;\n");
+    fixture.setTime("2025-01-01T00:00:30.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: proposalWorkflowId,
+        status: "completed",
+        threads: [{
+            status: "completed",
+            job: { provider: "claude", type: "coding", result: makeProposalResponse(
+                makeCandidateDiff(["test('retries once', () => {});"])
+            ) }
+        }]
+    }));
+
+    const halted = await fixture.loop.tick();
+    const artifact = JSON.parse(fs.readFileSync(
+        path.join(fixture.stateDirectory, "latest-proposal.json"),
+        "utf8"
+    ));
+
+    assert.equal(halted.status, "halted");
+    assert.equal(halted.stopReason, "proposal-static-preflight-rejected");
+    assert.equal(halted.usage.cycles, 0);
+    assert.equal(artifact.baseSnapshotHash, baseSnapshotHash);
+    assert.equal(artifact.staticPreflight.reasonCode, "workspace-changed-since-context");
+    assert.equal(artifact.validated, false);
+    assert.equal(artifact.applied, false);
+});
+
+test("a restart preserves the proposal stage and its authorized coding provider", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    const advice = await completeAdvice(fixture);
+    assert.equal(advice.cycleStage, "proposal");
+    const baseSnapshotHash = advice.workspaceBase.hash;
+
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    const restarted = fixture.restart();
+    const submitted = await restarted.tick();
+
+    assert.equal(submitted.phase, "polling");
+    assert.equal(submitted.cycleStage, "proposal");
+    assert.equal(submitted.usage.providerCalls, 5);
+    assert.equal(submitted.workspaceBase.hash, baseSnapshotHash);
+    const request = JSON.parse(fixture.calls[3].options.body);
+    assert.equal(request.threads[0].provider, "claude");
+    assert.equal(request.threads[0].type, "coding");
+});
+
+test("version-three state without a workspace snapshot fails closed at proposal preflight", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await completeAdvice(fixture);
+    const statePath = path.join(fixture.stateDirectory, "run-state.json");
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    delete state.workspaceBase;
+    resealState(state);
+    fs.writeFileSync(statePath, JSON.stringify(state));
+
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    const restarted = fixture.restart();
+    const submitted = await restarted.tick();
+    assert.equal(submitted.workspaceBase, null);
+    fixture.setTime("2025-01-01T00:00:30.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: proposalWorkflowId,
+        status: "completed",
+        threads: [{
+            status: "completed",
+            job: { provider: "claude", type: "coding", result: makeProposalResponse(
+                makeCandidateDiff(["test('retries once', () => {});"])
+            ) }
+        }]
+    }));
+
+    const halted = await restarted.tick();
+    const artifact = JSON.parse(fs.readFileSync(
+        path.join(fixture.stateDirectory, "latest-proposal.json"),
+        "utf8"
+    ));
+
+    assert.equal(halted.status, "halted");
+    assert.equal(artifact.staticPreflight.reasonCode, "workspace-base-unavailable");
+    assert.equal(artifact.validated, false);
+});
+
+test("malformed coding output halts without marking a cycle complete or proposal validated", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await completeAdvice(fixture);
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    await fixture.loop.tick();
+    fixture.setTime("2025-01-01T00:00:30.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: proposalWorkflowId,
+        status: "completed",
+        threads: [{ status: "completed", job: { type: "coding", result: "Here is an unstructured patch." } }]
+    }));
+
+    const halted = await fixture.loop.tick();
+
+    assert.equal(halted.status, "halted");
+    assert.equal(halted.stopReason, "invalid-workflow-result");
+    assert.equal(halted.usage.cycles, 0);
+    assert.equal(halted.pendingProviderCalls, 0);
+    assert.equal(halted.workflowId, null);
+    assert.equal(fs.existsSync(path.join(fixture.stateDirectory, "latest-proposal.json")), false);
+});
+
+test("proposal output that claims tests ran is rejected", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    const diff = makeCandidateDiff(["test('retries once', () => {});"]);
+    const halted = await completeProposal(fixture, makeProposalResponse(diff, { tests: "Tests passed." }));
+
+    assert.equal(halted.status, "halted");
+    assert.equal(halted.stopReason, "invalid-workflow-result");
+    assert.equal(halted.usage.cycles, 0);
+    assert.equal(fs.existsSync(path.join(fixture.stateDirectory, "latest-proposal.json")), false);
+});
+
+test("static preflight rejects disallowed paths, existing targets, and mismatched hunk counts", async t => {
+    const cases = [
+        {
+            diff: makeCandidateDiff(["test('retries once', () => {});"], "retry.test.js"),
+            reasonCode: "path-not-allowlisted"
+        },
+        {
+            diff: makeCandidateDiff(["test('retries once', () => {});"]),
+            reasonCode: "target-already-exists",
+            createTarget: true
+        },
+        {
+            diff: makeCandidateDiff(["test('retries once', () => {});"])
+                .replace("@@ -0,0 +1,1 @@", "@@ -0,0 +1,2 @@"),
+            reasonCode: "invalid-hunk-content"
+        }
+    ];
+
+    for (const testCase of cases) {
+        const fixture = createFixture();
+        t.after(fixture.cleanup);
+        if (testCase.createTarget) {
+            fs.writeFileSync(path.join(fixture.workspaceDirectory, candidateTestFilename), "existing file");
+        }
+
+        const halted = await completeProposal(fixture, makeProposalResponse(testCase.diff));
+        const artifact = JSON.parse(fs.readFileSync(
+            path.join(fixture.stateDirectory, "latest-proposal.json"),
+            "utf8"
+        ));
+
+        assert.equal(halted.status, "halted");
+        assert.equal(halted.stopReason, "proposal-static-preflight-rejected");
+        assert.equal(halted.usage.cycles, 0);
+        assert.equal(artifact.staticPreflight.status, "rejected");
+        assert.equal(artifact.staticPreflight.reasonCode, testCase.reasonCode);
+        assert.equal(artifact.validated, false);
+        assert.equal(artifact.applied, false);
+    }
+});
+
+test("a 429 releases the write-ahead reservation and permits a later bounded retry", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+
+    fixture.respond(jsonResponse(429, { error: "queue is full" }));
+    const rejected = await fixture.loop.tick();
+    assert.equal(rejected.phase, "ready-to-submit");
+    assert.equal(rejected.usage.providerCalls, 0);
+    assert.equal(rejected.pendingProviderCalls, 0);
+    assert.equal(rejected.lastHttpStatus, 429);
+
+    fixture.respond(jsonResponse(202, { id: workflowId, status: "queued" }));
+    const retried = await fixture.loop.tick();
+    assert.equal(retried.phase, "polling");
+    assert.equal(retried.usage.providerCalls, 3);
+    assert.equal(fixture.calls.length, 3);
+});
+
+test("a 429 during proposal admission releases only the proposal reservation", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await completeAdvice(fixture);
+
+    fixture.respond(jsonResponse(429, { error: "queue is full" }));
+    const rejected = await fixture.loop.tick();
+    assert.equal(rejected.phase, "ready-to-submit");
+    assert.equal(rejected.cycleStage, "proposal");
+    assert.equal(rejected.usage.providerCalls, 3);
+    assert.equal(rejected.pendingProviderCalls, 0);
+
+    fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
+    const accepted = await fixture.loop.tick();
+    assert.equal(accepted.phase, "polling");
+    assert.equal(accepted.usage.providerCalls, 5);
+    assert.equal(accepted.pendingProviderCalls, 2);
+    assert.equal(fixture.calls.length, 5);
+});
+
+test("an ambiguous coding submission is never retried", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await completeAdvice(fixture);
+    fixture.respond(new TypeError("connection dropped after send"));
+
+    const halted = await fixture.loop.tick();
+
+    assert.equal(halted.status, "halted");
+    assert.equal(halted.cycleStage, "proposal");
+    assert.equal(halted.stopReason, "ambiguous-provider-submission");
+    assert.equal(halted.usage.providerCalls, 5);
+    assert.equal(halted.pendingProviderCalls, 2);
+    assert.equal(fixture.loop.status().providerWorkMayContinue, true);
+    await fixture.loop.tick();
+    assert.equal(fixture.calls.length, 4);
+});
+
+test("an ambiguous submission is never retried and requires explicit acknowledgement to start again", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+    fixture.respond(new TypeError("connection dropped after send"));
+
+    const halted = await fixture.loop.tick();
+
+    assert.equal(halted.status, "halted");
+    assert.equal(halted.stopReason, "ambiguous-provider-submission");
+    assert.equal(halted.usage.providerCalls, 3);
+    assert.equal(halted.pendingProviderCalls, 3);
+    assert.equal(halted.lastHttpStatus, null);
+    assert.equal(fixture.loop.status().providerWorkMayContinue, true);
+    await fixture.loop.tick();
+    assert.equal(fixture.calls.length, 2);
+    assert.throws(() => fixture.loop.start(validConfiguration), /acknowledge-unknown-provider-work/);
+    const restarted = fixture.loop.start({
+        ...validConfiguration,
+        acknowledgeUnknownProviderWork: true
+    });
+    assert.equal(restarted.status, "configured");
+});
+
+test("a restart from the persisted submitting phase halts without replaying an accepted POST", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+    let resolveSubmission;
+    let notifySubmissionStarted;
+    const submissionStarted = new Promise(resolve => {
+        notifySubmissionStarted = resolve;
+    });
+    const pendingSubmission = new Promise(resolve => {
+        resolveSubmission = resolve;
+    });
+    fixture.respond(() => {
+        notifySubmissionStarted();
+        return pendingSubmission;
     });
 
-    assert.equal(restarted.status().tickCount, 0);
-    assert.equal(restarted.tick().tickCount, 1);
+    const interruptedTick = fixture.loop.tick();
+    await submissionStarted;
+    const originalRename = fs.renameSync;
+    fs.renameSync = () => {
+        throw new Error("simulated persistence failure after admission");
+    };
+    try {
+        resolveSubmission(jsonResponse(202, { id: workflowId, status: "queued" }));
+        await assert.rejects(interruptedTick, /simulated persistence failure/);
+    } finally {
+        fs.renameSync = originalRename;
+    }
+
+    const restarted = createImprovementLoop({
+        stateDirectory: fixture.stateDirectory,
+        now: () => new Date("2025-01-01T00:00:00.000Z"),
+        fetchImpl: async () => {
+            throw new Error("Restart recovery must not contact the service.");
+        }
+    });
+    const recovered = await restarted.tick();
+
+    assert.equal(recovered.status, "halted");
+    assert.equal(recovered.stopReason, "ambiguous-submission-after-restart");
+    assert.equal(recovered.providerWorkMayContinue, true);
+    assert.equal(recovered.usage.providerCalls, 3);
+    assert.equal(fixture.calls.length, 2);
+    assert.throws(() => restarted.start(validConfiguration), /acknowledge-unknown-provider-work/);
 });
 
-test("expired authorization is terminal and cannot be extended by a tick", t => {
+test("a lost workflow is halted and never resubmitted", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await submitWorkflow(fixture);
+    fixture.setTime("2025-01-01T00:00:15.000Z");
+    fixture.respond(jsonResponse(404, { error: "not found" }));
+
+    const lost = await fixture.loop.tick();
+
+    assert.equal(lost.status, "halted");
+    assert.equal(lost.stopReason, "workflow-lost-after-service-restart");
+    assert.equal(lost.providerWorkMayContinue, true);
+    await fixture.loop.tick();
+    assert.equal(fixture.calls.length, 3);
+});
+
+test("a failed workflow clears active-work indicators and halts the run", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await submitWorkflow(fixture);
+    fixture.setTime("2025-01-01T00:00:15.000Z");
+    fixture.respond(jsonResponse(200, { id: workflowId, status: "failed" }));
+
+    const failed = await fixture.loop.tick();
+
+    assert.equal(failed.status, "halted");
+    assert.equal(failed.stopReason, "workflow-failed");
+    assert.equal(failed.workflowId, null);
+    assert.equal(failed.pendingProviderCalls, 0);
+    assert.equal(failed.providerWorkMayContinue, undefined);
+});
+
+test("stop prevents future submissions and reports already-submitted provider work", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+
+    const stopped = fixture.loop.stop();
+    const nextTick = await fixture.loop.tick();
+
+    assert.equal(stopped.status, "stopped");
+    assert.equal(stopped.providerWorkMayContinue, false);
+    assert.equal(nextTick.status, "stopped");
+    assert.equal(fixture.calls.length, 1);
+});
+
+test("stopping an active workflow reports it and requires acknowledgement before a new run", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await submitWorkflow(fixture);
+
+    const stopped = fixture.loop.stop();
+
+    assert.equal(stopped.status, "stopped");
+    assert.equal(stopped.providerWorkMayContinue, true);
+    assert.throws(() => fixture.loop.start(validConfiguration), /acknowledge-unknown-provider-work/);
+    assert.equal(fixture.loop.start({
+        ...validConfiguration,
+        acknowledgeUnknownProviderWork: true
+    }).status, "configured");
+});
+
+test("authorization expiry prevents workflow submission", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+    fixture.setTime("2025-01-01T01:00:00.001Z");
+
+    const expired = await fixture.loop.tick();
+
+    assert.equal(expired.status, "expired");
+    assert.equal(expired.usage.providerCalls, 0);
+    assert.equal(fixture.calls.length, 1);
+});
+
+test("bounded polling may collect advice during the expiry grace without starting a code proposal", async t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
     fixture.loop.start(validConfiguration);
-    fixture.setTime("2025-01-01T01:00:00.001Z");
+    fixture.setTime("2025-01-01T00:59:45.000Z");
+    fixture.respond(jsonResponse(200, { summary: repositorySummary }));
+    await fixture.loop.tick();
+    fixture.respond(jsonResponse(202, { id: workflowId, status: "queued" }));
+    await fixture.loop.tick();
+    fixture.setTime("2025-01-01T01:00:15.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: workflowId,
+        status: "completed",
+        synthesis: { result: "Result collected during grace." }
+    }));
 
-    const expired = fixture.loop.tick();
-    const later = fixture.loop.tick();
+    const result = await fixture.loop.tick();
 
-    assert.equal(expired.status, "expired");
-    assert.equal(later.status, "expired");
-    assert.equal(later.tickCount, 0);
-    assert.equal(later.usage.providerCalls, 0);
-    assert.equal(fixture.loop.status().authorization.expiresAt, "2025-01-01T01:00:00.000Z");
+    assert.equal(result.status, "expired");
+    assert.equal(result.usage.cycles, 0);
+    assert.equal(result.pendingProviderCalls, 0);
+    assert.equal(result.workflowId, null);
+    assert.equal(result.cycleStage, "advice");
+    assert.equal(result.adviceArtifact, "latest-advice.json");
+    assert.equal(fixture.calls.length, 3);
 });
 
-test("an expired run can be replaced without a separate expiry tick", t => {
+test("provider advice is UTF-8 truncated within the configured result-text bound", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await submitWorkflow(fixture);
+    fixture.setTime("2025-01-01T00:00:15.000Z");
+    fixture.respond(jsonResponse(200, {
+        id: workflowId,
+        status: "completed",
+        synthesis: { result: "💡".repeat(6000) }
+    }));
+
+    await fixture.loop.tick();
+
+    const artifact = JSON.parse(fs.readFileSync(path.join(fixture.stateDirectory, "latest-advice.json"), "utf8"));
+    assert.equal(artifact.truncated, true);
+    assert.ok(Buffer.byteLength(artifact.selectedResult) <= 8 * 1024);
+    assert.ok(fs.statSync(path.join(fixture.stateDirectory, "latest-advice.json")).size <= 16 * 1024);
+});
+
+test("oversized service responses are rejected without unbounded buffering", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    fixture.loop.start(validConfiguration);
+    fixture.respond({
+        status: 200,
+        ok: true,
+        body: new ReadableStream({
+            start(controller) {
+                controller.enqueue(new Uint8Array(64 * 1024));
+                controller.enqueue(new Uint8Array(64 * 1024 + 1));
+            }
+        }),
+        text: async () => {
+            throw new Error("The bounded reader should not call text().");
+        }
+    });
+
+    const result = await fixture.loop.tick();
+
+    assert.equal(result.phase, "context");
+    assert.equal(result.contextFailures, 1);
+    assert.equal(result.lastErrorCode, "response-too-large");
+});
+
+test("a kill switch set during workflow submission stops the run without hiding possible provider work", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    await prepareSubmission(fixture);
+    let resolveSubmission;
+    let notifySubmissionStarted;
+    const submissionStarted = new Promise(resolve => {
+        notifySubmissionStarted = resolve;
+    });
+    const pendingSubmission = new Promise(resolve => {
+        resolveSubmission = resolve;
+    });
+    fixture.respond(() => {
+        notifySubmissionStarted();
+        return pendingSubmission;
+    });
+
+    const tick = fixture.loop.tick();
+    await submissionStarted;
+    const stopResult = fixture.loop.stop();
+    assert.equal(stopResult.status, "stop-requested");
+    assert.equal(stopResult.providerWorkMayContinue, true);
+    resolveSubmission(jsonResponse(202, { id: workflowId, status: "queued" }));
+
+    const stopped = await tick;
+
+    assert.equal(stopped.status, "stopped");
+    assert.equal(stopped.providerWorkMayContinue, true);
+    assert.equal(stopped.workflowId, workflowId);
+});
+
+test("an active run cannot be overwritten; expired runs can be explicitly replaced", t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
     const previous = fixture.loop.start(validConfiguration);
+    assert.throws(() => fixture.loop.start(validConfiguration), /already exists/);
     fixture.setTime("2025-01-01T01:00:00.001Z");
 
     const next = fixture.loop.start(validConfiguration);
@@ -140,53 +973,21 @@ test("an expired run can be replaced without a separate expiry tick", t => {
     assert.equal(next.status, "configured");
 });
 
-test("a backwards system-clock jump halts the run without reducing timestamps", t => {
+test("backwards clock movement halts the run", async t => {
     const fixture = createFixture();
     t.after(fixture.cleanup);
     fixture.loop.start(validConfiguration);
-    fixture.loop.tick();
+    fixture.respond(jsonResponse(200, { summary: repositorySummary }));
+    await fixture.loop.tick();
     fixture.setTime("2024-12-31T23:59:59.000Z");
 
-    const halted = fixture.loop.tick();
+    const halted = await fixture.loop.tick();
 
     assert.equal(halted.status, "halted");
     assert.equal(halted.stopReason, "clock-moved-backwards");
-    assert.equal(halted.tickCount, 1);
-    assert.equal(halted.updatedAt, "2025-01-01T00:00:00.000Z");
 });
 
-test("stop signal is observed before any cycle work", t => {
-    const fixture = createFixture();
-    t.after(fixture.cleanup);
-    fixture.loop.start(validConfiguration);
-
-    const stopped = fixture.loop.stop();
-    const nextTick = fixture.loop.tick();
-
-    assert.equal(stopped.status, "stopped");
-    assert.equal(nextTick.status, "stopped");
-    assert.equal(nextTick.usage.providerCalls, 0);
-    assert.equal(nextTick.tickCount, 0);
-});
-
-test("kill switch takes precedence over corrupt run state", t => {
-    const fixture = createFixture();
-    t.after(fixture.cleanup);
-    fixture.loop.start(validConfiguration);
-    const statePath = path.join(fixture.stateDirectory, "run-state.json");
-    const stopPath = path.join(fixture.stateDirectory, "STOP");
-    fs.writeFileSync(statePath, "{broken");
-    fs.writeFileSync(stopPath, "{}");
-    const before = fs.readFileSync(statePath);
-
-    const result = fixture.loop.tick();
-
-    assert.equal(result.status, "stop-requested");
-    assert.match(result.message, /run state is invalid/);
-    assert.deepEqual(fs.readFileSync(statePath), before);
-});
-
-test("a live lock skips a tick without mutating state", t => {
+test("a live lock skips a tick without mutating state", async t => {
     const fixture = createFixture({ isProcessAlive: () => true });
     t.after(fixture.cleanup);
     fixture.loop.start(validConfiguration);
@@ -197,13 +998,13 @@ test("a live lock skips a tick without mutating state", t => {
         startedAt: "2025-01-01T00:00:00.000Z"
     }));
 
-    const result = fixture.loop.tick();
+    const result = await fixture.loop.tick();
 
     assert.equal(result.status, "locked");
     assert.equal(fixture.loop.status().tickCount, 0);
 });
 
-test("a stale lock from a dead process is recovered safely", t => {
+test("a stale lock from a dead process is recovered safely", async t => {
     const fixture = createFixture({ isProcessAlive: () => false });
     t.after(fixture.cleanup);
     fixture.loop.start(validConfiguration);
@@ -213,8 +1014,9 @@ test("a stale lock from a dead process is recovered safely", t => {
         token: "stale-lock",
         startedAt: "2024-12-31T23:55:00.000Z"
     }));
+    fixture.respond(jsonResponse(200, { summary: repositorySummary }));
 
-    const result = fixture.loop.tick();
+    const result = await fixture.loop.tick();
 
     assert.equal(result.tickCount, 1);
     assert.equal(fs.existsSync(lockPath), false);
@@ -230,33 +1032,21 @@ test("corrupt or tampered state is not silently repaired or overwritten", t => {
     fs.writeFileSync(statePath, JSON.stringify(state));
     const before = fs.readFileSync(statePath);
 
-    assert.throws(() => fixture.loop.tick(), /invalid or has an unsupported version/);
+    assert.throws(() => fixture.loop.status(), /invalid or has an unsupported version/);
     assert.deepEqual(fs.readFileSync(statePath), before);
 });
 
-test("decreased counters are rejected and the state file remains unchanged", t => {
-    const fixture = createFixture();
-    t.after(fixture.cleanup);
-    fixture.loop.start(validConfiguration);
-    fixture.loop.tick();
-    const statePath = path.join(fixture.stateDirectory, "run-state.json");
-    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    state.tickCount = 0;
-    fs.writeFileSync(statePath, JSON.stringify(state));
-    const before = fs.readFileSync(statePath);
-
-    assert.throws(() => fixture.loop.tick(), /invalid or has an unsupported version/);
-    assert.deepEqual(fs.readFileSync(statePath), before);
-});
-
-test("CLI requires explicit cloud-provider sharing authorization", () => {
-    const fixture = createFixture();
-    try {
-        const parsed = parseArguments(["start", "--providers", "claude", "--max-cycles", "1"]);
-        assert.throws(() => fixture.loop.start(parsed.configuration), /confirm-provider-sharing/);
-    } finally {
-        fixture.cleanup();
-    }
+test("CLI requires explicit cloud-provider sharing authorization and parses unknown-work acknowledgement", () => {
+    const parsedWithoutConsent = parseArguments(["start", "--providers", "claude", "--max-cycles", "1"]);
+    assert.equal(parsedWithoutConsent.configuration.confirmedProviderSharing, undefined);
+    assert.throws(() => parseArguments(["sandbox-probe"]), /requires --confirm-sandbox-transfer/);
+    assert.deepEqual(parseArguments([
+        "sandbox-probe",
+        "--confirm-sandbox-transfer"
+    ]), {
+        command: "sandbox-probe",
+        confirmedSandboxTransfer: true
+    });
     assert.deepEqual(parseArguments([
         "start",
         "--providers", "claude,gemini",
@@ -264,18 +1054,20 @@ test("CLI requires explicit cloud-provider sharing authorization", () => {
         "--max-provider-calls", "8",
         "--max-searches", "4",
         "--window-minutes", "60",
-        "--confirm-provider-sharing"
+        "--confirm-provider-sharing",
+        "--acknowledge-unknown-provider-work"
     ]).configuration, {
         providers: ["claude", "gemini"],
         maxCycles: 3,
         maxProviderCalls: 8,
         maxSearches: 4,
         windowMinutes: 60,
-        confirmedProviderSharing: true
+        confirmedProviderSharing: true,
+        acknowledgeUnknownProviderWork: true
     });
 });
 
-test("controller has no provider, network, browser, or command-execution imports", () => {
+test("controller has no shell, browser, or provider-client imports", () => {
     const source = fs.readFileSync(path.join(__dirname, "improvement-loop.js"), "utf8");
     assert.doesNotMatch(source, /require\(["'](?:node:)?(?:child_process|http|https|playwright)["']/);
     assert.doesNotMatch(source, /require\(["'][^"']*(?:provider|coding-job|offloading-agent)[^"']*["']/);

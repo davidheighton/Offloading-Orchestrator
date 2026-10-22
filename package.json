@@ -7,6 +7,8 @@
     "start": "node offloading-agent.js",
     "improve": "node improvement-advisor.js",
     "improve:loop": "node improvement-loop.js",
+    "improve:loop:sandbox-probe": "node sandbox-canary.js",
+    "improve:loop:sandbox-stage-probe": "node sandbox-stage-probe.js",
     "code": "node coding-job.js",
     "models": "node ollama-model-cli.js",
     "test": "node --test"

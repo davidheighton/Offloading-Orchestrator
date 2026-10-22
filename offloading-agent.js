@@ -9,6 +9,7 @@ const { run: runGemini } = require("./gemini");
 const { run: runClaude } = require("./claude");
 const { run: runMetaAI } = require("./meta-ai");
 const ollama = require("./ollama");
+const { isSensitiveFile, redactSensitiveText } = require("./sensitive-text");
 const { calculateOllamaModelRankings, getRequestSize, preferenceFields, validateModelPreference } = require("./ollama-models");
 const { getBaselineModelCatalog, getLatestOllamaBaselines, persistOllamaBaselineRun, readOllamaBaselineRuns, validateOllamaBaselineRun } = require("./ollama-baselines");
 
@@ -691,29 +692,10 @@ async function persistKnowledgeSummary(job) {
     job.knowledgeKey = key;
 }
 
-function isSensitiveFile(relativePath) {
-    return relativePath.split(path.sep).some(part => {
-        const name = part.toLowerCase();
-        return name.startsWith(".env") ||
-            /(^|[._-])(secret|secrets|credential|credentials|private|token)([._-]|$)/i.test(name) ||
-            /\.(pem|p12|pfx|key)$/i.test(name);
-    });
-}
-
-function redactSensitiveText(text) {
-    return text
-        .replace(/-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/gi, "[REDACTED PRIVATE KEY]")
-        .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|auth(?:orization)?|client[_-]?secret|secret|password|private[_-]?key|connection[_-]?string)["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^"'\r\n,;}]+)/gi, (match, prefix, value) => {
-            const quote = value[0] === "\"" || value[0] === "'" ? value[0] : "";
-            return `${prefix}${quote}[REDACTED]${quote}`;
-        })
-        .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]");
-}
-
 function getRepositoryFilePriority(relativePath) {
     if (/^readme(?:\.|$)/i.test(path.basename(relativePath))) return 5;
     if (path.basename(relativePath).toLowerCase() === "package.json") return 4;
-    if (/offloading-agent\.[cm]?js$/i.test(relativePath)) return 3;
+    if (/(?:offloading-agent|copilot-free)\.[cm]?js$/i.test(relativePath)) return 3;
     if (/\.test\.[cm]?js$/i.test(relativePath)) return 2;
     return 1;
 }
