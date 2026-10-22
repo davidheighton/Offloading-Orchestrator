@@ -5,7 +5,7 @@ A local Node.js service for coordinating browser-based provider jobs, workflows,
 ## Requirements
 
 - Node.js 24 or newer
-- Ollama for local Qwen requests
+- Optional Ollama installation for direct, idle-time text cleanup jobs
 - Browser sign-in for any browser-backed provider you use
 
 ## Install and test
@@ -31,9 +31,11 @@ API requests must use `127.0.0.1` or `localhost` on the service port. Browser `O
 The dashboard includes coding/thinking rankings for providers and Ollama models, with a request-size filter for model rankings. Ranking data refreshes every 15 seconds; overview activity refreshes every 5 seconds.
 Finished workflows are retained for up to 24 hours and 200 records; active workflows are never evicted. Expired workflow IDs return 404.
 
-## Configure local Ollama
+## Optional local text cleanup with Ollama
 
-Start Ollama separately and ensure the selected model is available. The default is `qwen3.5:9b` at `http://127.0.0.1:11434`.
+Ollama is restricted to direct text cleanup jobs. It is not available for coding or thinking jobs, workflow branches or synthesis, or automatic provider routing. Cleanup jobs run only when no non-cleanup job is queued or running; sustained normal traffic can therefore defer cleanup indefinitely. A normal job may start while cleanup is already running.
+
+Start Ollama separately and ensure its configured model is available. The default is `qwen3.5:9b` at `http://127.0.0.1:11434`.
 
 ```powershell
 $env:OLLAMA_HOST = 'http://127.0.0.1:11434'
@@ -54,31 +56,45 @@ npm run improve -- "Describe the improvement goal" --confirm-provider-sharing --
 
 The explicit confirmation flag is required. Repository context is collected locally, bounded and redacted before being shared with the configured review providers. The review workflow does not edit files or deploy changes.
 
+## Improvement loop controller (scaffold only)
+
+The controller provides bounded run configuration, durable local state, stop controls, and restartable bookkeeping ticks. It does not yet research the web, call providers, generate or apply patches, run tests, or execute commands. Every command prints this limitation; tick counters are not completed improvement cycles.
+
+State is stored outside the workspace under the current user's local application-data directory. To configure a run, explicitly provide cloud providers, budgets, a time window, and provider-sharing authorization:
+
+```powershell
+npm run improve:loop -- start --providers claude,gemini --max-cycles 3 --max-provider-calls 8 --max-searches 4 --window-minutes 240 --confirm-provider-sharing
+npm run improve:loop -- status
+npm run improve:loop -- tick
+npm run improve:loop -- stop
+```
+
+The provider allowlist excludes Ollama. The saved authorization is configuration for future implementation only; it does not satisfy or bypass the offloading service's provider-sharing checks. State files contain run metadata and counters, not prompts or provider output. The controller does not create a scheduler; an external scheduler may invoke `tick`, which currently records a heartbeat only. Promotion to the live branch and deployment remain out of scope.
+Hard limits are 10 cycles, 50 provider calls, 20 searches, and a 12-hour window; the window must be at least 5 minutes. Budgets are recorded but unused until cycle execution is implemented.
+
+Submit a direct cleanup job with `POST /jobs`:
+
+```powershell
+$body = @{
+  confirmedProviderSharing = $true
+  type = 'cleanup'
+  provider = 'ollama'
+  message = 'Please fix grammar and punctuation in this text.'
+} | ConvertTo-Json
+Invoke-RestMethod -Uri 'http://127.0.0.1:8765/jobs' -Method Post -ContentType 'application/json' -Body $body
+```
+
+Cleanup is limited to grammar, punctuation, and formatting; the prompt treats the submitted text as untrusted data and requests only the cleaned text in response. The result is advisory text and must not be executed or automatically passed into another job. Optional Ollama model ranking and model-management endpoints remain available for local model analytics; they do not enable Ollama coding or thinking jobs.
+
 ## Submit a coding job
 
 Submit a focused task with one or more workspace-relative source files:
 
 ```powershell
-npm run code -- "Fix the total calculation" --provider ollama --context-file src/totals.js --context-file tests/totals.test.js --timeout-ms 300000 --confirm-provider-sharing
+npm run code -- "Fix the total calculation" --provider auto --context-file src/totals.js --context-file tests/totals.test.js --timeout-ms 300000 --confirm-provider-sharing
 ```
 
-Ollama coding jobs rank installed models automatically for coding and request size. Inspect rankings for a task shape, or set per-model preferences from 1 to 5:
-
-```powershell
-npm run models -- list --skill coding --size medium
-npm run models -- rank --skill thinking --size large
-npm run models -- rate qwen2.5-coder:7b --coding 5 --thinking 2 --small 4 --medium 5 --large 3
-```
-
-Preferences are saved in `.copilot-knowledge/ollama-model-preferences.json`. Completed Ollama jobs can also be graded with the existing job feedback endpoint; that feedback is associated with the exact model tag. To override automatic selection for a single coding job, pass `--model <installed-tag>` or `--model auto` together with `--provider ollama`:
-
-Baseline runs are stored separately in `.copilot-knowledge/ollama-baselines.json`; their assessment does not change preference or feedback scores. The rankings table shows each model's latest baseline across task and request-size filters, with its task and size labeled. Record a run with `POST /ollama/models/baselines` using `runId`, `task`, `skill`, `size`, `testedAt`, `settings` (`temperature`, `contextTokens`, `outputTokens`, `think`), and a `results` array. Each result has a model tag, `runStatus` (`completed`, `failed`, or `timeout`), `assessment` (`pass`, `partial`, `fail`, or `incomplete`), and optional timing/token metrics and note.
-
-```powershell
-npm run code -- "Fix the total calculation" --provider ollama --model qwen2.5-coder:7b --confirm-provider-sharing
-```
-
-Model discovery and inference both use the local Ollama loopback service. Non-Ollama providers are unaffected.
+Automatic coding and thinking workflows use cloud providers only. Model overrides and local model rankings do not route coding or thinking jobs to Ollama.
 
 Each context file must resolve inside the current workspace, must not be a sensitive file (such as `.env` or credentials), and must be no larger than 4 KiB; combined context is also capped at 4 KiB of UTF-8 text. Common secret assignments and bearer tokens are redacted before file paths and contents are sent to the selected provider as untrusted reference data. `--timeout-ms` controls how long the CLI polls, from 1,000 ms to 900,000 ms; the default is 900,000 ms. The CLI prints the proposed result and never applies changes to the workspace. Omit `--context-file` when the task does not need source context; `--provider` defaults to automatic coding-job routing.
 

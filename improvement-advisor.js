@@ -11,7 +11,7 @@ const workflowTimeoutMs = 30 * 60 * 1000;
 const clarificationJobTimeoutMs = 3 * 60 * 1000;
 const clarificationSessionTimeoutMs = 20 * 60 * 1000;
 const maxClarificationQuestions = 10;
-const supportedProviders = new Set(["copilot", "chatgpt", "gemini", "claude", "meta", "ollama"]);
+const supportedProviders = new Set(["copilot", "chatgpt", "gemini", "claude", "meta"]);
 
 function getServiceBaseUrl(value = process.env.OFFLOADING_AGENT_URL || defaultServiceUrl) {
     let url;
@@ -181,12 +181,6 @@ function createImprovementWorkflowPayload(goal, summary) {
             prompt: `${sharedContext}\n\nRecommend deterministic tests and baseline measurements for one improvement. Include regression gates, flakiness handling, and explicit criteria for rejecting a candidate that does not demonstrate a gain.`
         },
         {
-            name: "Local Qwen implementation feasibility review",
-            type: "thinking",
-            provider: "ollama",
-            prompt: `${sharedContext}\n\nAssess the smallest implementation surface for one improvement. Identify likely files, a narrowly scoped change, existing test patterns to reuse, and risks. Do not provide a patch.`
-        },
-        {
             name: "Claude safety review",
             type: "thinking",
             provider: "claude",
@@ -196,7 +190,7 @@ function createImprovementWorkflowPayload(goal, summary) {
 
     return {
         goal: `Read-only improvement advice: ${goal.trim()}`,
-        synthesisProvider: "ollama",
+        synthesisProvider: "auto",
         threads: perspectives.map(perspective => ({ ...perspective, required: false }))
     };
 }

@@ -3,7 +3,6 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { getServiceBaseUrl, requestJson } = require("./improvement-advisor");
 const { isSensitiveFile, maxCodingContextBytes, normalizeProvider } = require("./offloading-agent");
-const { getOllamaModel } = require("./ollama");
 
 const jobTimeoutMs = 15 * 60 * 1000;
 const minJobTimeoutMs = 1000;
@@ -14,7 +13,6 @@ const serviceRequestTimeoutMs = 30000;
 function parseCodingJobArgs(args) {
     let confirmedProviderSharing = false;
     let provider = "auto";
-    let model;
     let timeoutMs = jobTimeoutMs;
     const contextFiles = [];
     const messageParts = [];
@@ -25,11 +23,9 @@ function parseCodingJobArgs(args) {
         } else if (args[index] === "--provider") {
             if (!args[index + 1]) throw new Error("--provider requires a provider name.");
             provider = normalizeProvider(args[++index]);
-            if (provider === "auto") continue;
-        } else if (args[index] === "--model") {
-            if (!args[index + 1]) throw new Error("--model requires an installed Ollama model tag or 'auto'.");
-            const selectedModel = args[++index];
-            model = selectedModel === "auto" ? "auto" : getOllamaModel(selectedModel);
+            if (provider === "ollama") {
+                throw new Error("Ollama is restricted to direct cleanup jobs and cannot be used for coding.");
+            }
         } else if (args[index] === "--context-file") {
             if (!args[index + 1]) throw new Error("--context-file requires a workspace-relative file path.");
             const contextFile = args[++index];
@@ -56,11 +52,7 @@ function parseCodingJobArgs(args) {
     if (!confirmedProviderSharing) {
         throw new Error("Pass --confirm-provider-sharing before sending a coding job to a provider.");
     }
-    if (model !== undefined && provider !== "ollama") {
-        throw new Error("--model is available only with --provider ollama.");
-    }
-
-    return { message, provider, ...(model !== undefined ? { model } : {}), contextFiles, timeoutMs, confirmedProviderSharing };
+    return { message, provider, contextFiles, timeoutMs, confirmedProviderSharing };
 }
 
 async function readCodingContextFile(filePath, workspacePath = process.cwd()) {
@@ -125,6 +117,13 @@ async function runCodingJob(message, options = {}) {
     if (typeof message !== "string" || !message.trim()) {
         throw new Error("A non-empty coding request is required.");
     }
+    const provider = options.provider || "auto";
+    if (provider === "ollama") {
+        throw new Error("Ollama is restricted to direct cleanup jobs and cannot be used for coding.");
+    }
+    if (options.model !== undefined) {
+        throw new Error("Model overrides are not available for coding jobs.");
+    }
 
     const fetchImpl = options.fetchImpl || fetch;
     const baseUrl = getServiceBaseUrl(options.serviceUrl);
@@ -139,8 +138,7 @@ async function runCodingJob(message, options = {}) {
         body: JSON.stringify({
             confirmedProviderSharing: true,
             type: "coding",
-            provider: options.provider || "auto",
-            ...(options.model !== undefined ? { model: options.model } : {}),
+            provider,
             message: message.trim(),
             ...(context !== undefined ? { context } : {})
         })
