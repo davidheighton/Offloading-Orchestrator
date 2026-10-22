@@ -15,7 +15,8 @@ function getExpectedReplyTimeout(message) {
 }
 
 function getComposer(page) {
-    return page.locator(composerSelector).first();
+    const composers = page.locator(composerSelector);
+    return (typeof composers.filter === "function" ? composers.filter({ visible: true }) : composers).first();
 }
 
 async function enableThinkMode(page) {
@@ -337,6 +338,7 @@ if (require.main === module) {
 module.exports = {
     enableThinkMode,
     getAuthenticationError,
+    getComposer,
     getExpectedReplyTimeout,
     getLastAssistantMessage,
     getLastAssistantTurn,

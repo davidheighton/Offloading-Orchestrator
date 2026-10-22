@@ -15,7 +15,7 @@ async function getGeminiPage(context) {
 async function sendMessage(page, composer, message) {
     await composer.fill(message.trim());
 
-    const sendButton = page.getByRole("button", { name: /^send message$/i });
+    const sendButton = page.getByRole("button", { name: /^(send message|send)$/i });
     await sendButton.waitFor({ state: "visible", timeout: 10000 });
     try {
         await sendButton.click({ timeout: 10000 });
@@ -115,11 +115,15 @@ async function waitForAssistantReply(page, previousReply, timeout = 90000) {
 
     while (Date.now() - start < timeout) {
         const reply = await getLastAssistantMessage(page);
-        const generating = await page
-            .locator('[aria-label*="Stop" i], [data-test-id*="stop" i]')
-            .count()
-            .then(count => count > 0)
-            .catch(() => false);
+        const stopIndicators = page.locator('[aria-label*="Stop" i], [data-test-id*="stop" i]');
+        const stopIndicatorCount = await stopIndicators.count().catch(() => 0);
+        let generating = false;
+        for (let index = 0; index < stopIndicatorCount; index += 1) {
+            if (await stopIndicators.nth(index).isVisible().catch(() => false)) {
+                generating = true;
+                break;
+            }
+        }
 
         if (reply && reply !== previousReply && !generating) {
             stableReads = reply === candidate ? stableReads + 1 : 1;
@@ -223,6 +227,7 @@ module.exports = {
     run,
     saveActiveConversationUrl,
     sendMessage,
+    waitForAssistantReply,
     waitForConversationReady,
     waitForUserTurn
 };

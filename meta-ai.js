@@ -64,11 +64,15 @@ async function waitForAssistantReply(page, previousReply, message, timeout = 900
 
     while (Date.now() - start < timeout) {
         const reply = await getLastAssistantMessage(page);
-        const generating = await page
-            .locator('[data-testid="assistant-message"]:not([data-streaming-state="DONE"])')
-            .count()
-            .then(count => count > 0)
-            .catch(() => false);
+        const streamingMessages = page.locator('[data-testid="assistant-message"]:not([data-streaming-state="DONE"])');
+        const streamingMessageCount = await streamingMessages.count().catch(() => 0);
+        let generating = false;
+        for (let index = 0; index < streamingMessageCount; index += 1) {
+            if (await streamingMessages.nth(index).isVisible().catch(() => false)) {
+                generating = true;
+                break;
+            }
+        }
 
         if (reply && reply !== previousReply && reply !== message.trim() && !generating) {
             stableReads = reply === candidate ? stableReads + 1 : 1;
@@ -159,4 +163,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { getAuthenticationError, getLastAssistantMessage, run, sendMessage };
+module.exports = { getAuthenticationError, getLastAssistantMessage, run, sendMessage, waitForAssistantReply };

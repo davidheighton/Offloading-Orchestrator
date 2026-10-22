@@ -3,6 +3,7 @@ const path = require("node:path");
 const { setTimeout: delay } = require("node:timers/promises");
 const { getServiceBaseUrl, requestJson } = require("./improvement-advisor");
 const { isSensitiveFile, maxCodingContextBytes, normalizeProvider } = require("./offloading-agent");
+const { getOllamaModel } = require("./ollama");
 
 const jobTimeoutMs = 15 * 60 * 1000;
 const minJobTimeoutMs = 1000;
@@ -13,6 +14,7 @@ const serviceRequestTimeoutMs = 30000;
 function parseCodingJobArgs(args) {
     let confirmedProviderSharing = false;
     let provider = "auto";
+    let model;
     let timeoutMs = jobTimeoutMs;
     const contextFiles = [];
     const messageParts = [];
@@ -24,6 +26,10 @@ function parseCodingJobArgs(args) {
             if (!args[index + 1]) throw new Error("--provider requires a provider name.");
             provider = normalizeProvider(args[++index]);
             if (provider === "auto") continue;
+        } else if (args[index] === "--model") {
+            if (!args[index + 1]) throw new Error("--model requires an installed Ollama model tag or 'auto'.");
+            const selectedModel = args[++index];
+            model = selectedModel === "auto" ? "auto" : getOllamaModel(selectedModel);
         } else if (args[index] === "--context-file") {
             if (!args[index + 1]) throw new Error("--context-file requires a workspace-relative file path.");
             const contextFile = args[++index];
@@ -50,8 +56,11 @@ function parseCodingJobArgs(args) {
     if (!confirmedProviderSharing) {
         throw new Error("Pass --confirm-provider-sharing before sending a coding job to a provider.");
     }
+    if (model !== undefined && provider !== "ollama") {
+        throw new Error("--model is available only with --provider ollama.");
+    }
 
-    return { message, provider, contextFiles, timeoutMs, confirmedProviderSharing };
+    return { message, provider, ...(model !== undefined ? { model } : {}), contextFiles, timeoutMs, confirmedProviderSharing };
 }
 
 async function readCodingContextFile(filePath, workspacePath = process.cwd()) {
@@ -131,6 +140,7 @@ async function runCodingJob(message, options = {}) {
             confirmedProviderSharing: true,
             type: "coding",
             provider: options.provider || "auto",
+            ...(options.model !== undefined ? { model: options.model } : {}),
             message: message.trim(),
             ...(context !== undefined ? { context } : {})
         })
@@ -166,7 +176,7 @@ async function main(args) {
         serviceUrl: process.env.OFFLOADING_AGENT_URL,
         onStatus: status => console.log(`Coding job status: ${status}`)
     });
-    console.log(`\nCoding job ${job.id} via ${job.provider}: ${job.status}`);
+    console.log(`\nCoding job ${job.id} via ${job.provider}${job.model ? ` (${job.model})` : ""}: ${job.status}`);
     if (job.status === "completed") {
         console.log("Proposed result only; no workspace files were modified.");
         console.log(typeof job.result === "string" ? job.result : JSON.stringify(job.result, null, 2));

@@ -1,7 +1,10 @@
 const refreshIntervalMs = 5000;
+const rankingRefreshIntervalMs = 15000;
 const workflowPollIntervalMs = 2000;
 const terminalWorkflowStates = new Set(["completed", "partial", "failed", "cancelled", "canceled", "expired"]);
 let workflowDetailRequestId = 0;
+let rankingRequestId = 0;
+let selectedRankingSkill = "coding";
 
 const elements = {
     connection: document.querySelector("#connection-state"),
@@ -10,6 +13,12 @@ const elements = {
     activityStrip: document.querySelector("#activity-strip"),
     providerRows: document.querySelector("#provider-rows"),
     providerStatus: document.querySelector("#provider-status"),
+    rankingSkill: document.querySelector("#ranking-skill"),
+    rankingSize: document.querySelector("#ranking-size"),
+    vendorRankingRows: document.querySelector("#vendor-ranking-rows"),
+    vendorRankingStatus: document.querySelector("#vendor-ranking-status"),
+    modelRankingRows: document.querySelector("#model-ranking-rows"),
+    modelRankingStatus: document.querySelector("#model-ranking-status"),
     workflowList: document.querySelector("#workflow-list"),
     jobRows: document.querySelector("#job-rows"),
     form: document.querySelector("#advice-form"),
@@ -76,6 +85,104 @@ function renderProviders(providers) {
         row.append(availabilityCell);
         return row;
     }));
+}
+
+function renderVendorRankings(ranking) {
+    if (!ranking.vendors.length) {
+        elements.vendorRankingRows.replaceChildren(emptyRow(8, "No provider rankings available."));
+        return;
+    }
+    elements.vendorRankingRows.replaceChildren(...ranking.vendors.map(vendor => {
+        const row = document.createElement("tr");
+        row.append(
+            makeElement("td", "", String(vendor.rank)),
+            makeElement("td", "", vendor.provider),
+            makeElement("td", "ranking-score", `${Number(vendor.score).toFixed(2)} / 5`),
+            makeElement("td", "", vendor.sampleCount ? `${Number(vendor.averageScore).toFixed(2)} · ${vendor.sampleCount}` : "No ratings"),
+            makeElement("td", "", String(vendor.activeJobs)),
+            makeElement("td", "", String(vendor.completedLast24Hours ?? 0)),
+            makeElement("td", "", String(vendor.failedLast24Hours ?? 0)),
+            makeElement("td", vendor.offline ? "provider-offline" : "", vendor.offline ? "Offline" : "Online")
+        );
+        return row;
+    }));
+    elements.vendorRankingStatus.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+
+function renderModelRankings(ranking) {
+    if (!ranking.models.length) {
+        elements.modelRankingRows.replaceChildren(emptyRow(7, "No chat-capable Ollama models found."));
+        elements.modelRankingStatus.textContent = "No eligible models";
+        return;
+    }
+    elements.modelRankingRows.replaceChildren(...ranking.models.map(model => {
+        const row = document.createElement("tr");
+        const cells = [
+            makeElement("td", "", String(model.rank)),
+            makeElement("td", "", model.name),
+            makeElement("td", "ranking-score", `${Number(model.score).toFixed(2)} / 5`),
+            makeElement("td", "", model.feedbackCount ? `${Number(model.feedbackScore).toFixed(2)} · ${model.feedbackCount}` : "No ratings"),
+            makeElement("td", "", String(model.activeJobs)),
+            makeElement("td", "", String(model.completedJobs))
+        ];
+        const baselineCell = document.createElement("td");
+        if (model.baseline) {
+            const assessment = model.baseline.assessment;
+            const baselineSkill = model.baseline.skill[0].toUpperCase() + model.baseline.skill.slice(1);
+            const baselineSize = model.baseline.size[0].toUpperCase() + model.baseline.size.slice(1);
+            const label = `${baselineSkill} · ${baselineSize}: ${assessment} · ${model.baseline.runStatus}`;
+            baselineCell.append(makeElement("span", `status baseline-${assessment}`, label));
+            const metrics = [];
+            if (Number.isFinite(model.baseline.elapsedSeconds)) metrics.push(`${model.baseline.elapsedSeconds.toFixed(1)}s`);
+            if (Number.isInteger(model.baseline.outputTokens)) metrics.push(`${model.baseline.outputTokens} tokens`);
+            if (Number.isFinite(model.baseline.generationTokensPerSecond)) {
+                metrics.push(`${model.baseline.generationTokensPerSecond.toFixed(1)} tok/s`);
+            }
+            if (metrics.length) baselineCell.append(makeElement("small", "baseline-metrics", metrics.join(" · ")));
+            if (model.baseline.note) baselineCell.title = model.baseline.note;
+        } else {
+            baselineCell.textContent = "Not run";
+            baselineCell.className = "baseline-not-run";
+        }
+        cells.push(baselineCell);
+        row.append(...cells);
+        return row;
+    }));
+    const statusParts = [];
+    if (ranking.configuredDefault) statusParts.push(`Default: ${ranking.configuredDefault}`);
+    if (ranking.catalogUnavailable) statusParts.push("Ollama unavailable · showing saved baseline models");
+    const excludedCount = ranking.catalog.filter(model => model.selectable === false).length;
+    if (excludedCount) statusParts.push(`${excludedCount} non-chat excluded`);
+    statusParts.push(`Updated ${new Date().toLocaleTimeString()}`);
+    elements.modelRankingStatus.textContent = statusParts.join(" · ");
+}
+
+async function refreshRankings() {
+    const requestId = ++rankingRequestId;
+    const skill = selectedRankingSkill;
+    const size = elements.rankingSize.value || "medium";
+    const [vendorResult, modelResult] = await Promise.allSettled([
+        requestJson(`/vendors/rankings?skill=${encodeURIComponent(skill)}`),
+        requestJson(`/ollama/models?skill=${encodeURIComponent(skill)}&size=${encodeURIComponent(size)}`)
+    ]);
+    if (requestId !== rankingRequestId) return;
+
+    if (vendorResult.status === "fulfilled") {
+        renderVendorRankings(vendorResult.value);
+        elements.vendorRankingStatus.className = "section-note";
+    } else {
+        elements.vendorRankingRows.replaceChildren(emptyRow(8, vendorResult.reason.message));
+        elements.vendorRankingStatus.textContent = "Unavailable";
+        elements.vendorRankingStatus.className = "section-note ranking-unavailable";
+    }
+    if (modelResult.status === "fulfilled") {
+        renderModelRankings(modelResult.value);
+        elements.modelRankingStatus.className = "section-note";
+    } else {
+        elements.modelRankingRows.replaceChildren(emptyRow(7, modelResult.reason.message));
+        elements.modelRankingStatus.textContent = "Unavailable";
+        elements.modelRankingStatus.className = "section-note ranking-unavailable";
+    }
 }
 
 async function updateProviderAvailability(provider, button) {
@@ -167,6 +274,17 @@ async function refreshDashboard() {
         elements.updatedAt.textContent = error.message;
     }
 }
+
+elements.rankingSkill.addEventListener("click", event => {
+    const button = event.target.closest("button[data-skill]");
+    if (!button || button.getAttribute("aria-pressed") === "true") return;
+    selectedRankingSkill = button.dataset.skill;
+    for (const option of elements.rankingSkill.querySelectorAll("button[data-skill]")) {
+        option.setAttribute("aria-pressed", String(option === button));
+    }
+    void refreshRankings();
+});
+elements.rankingSize.addEventListener("change", () => void refreshRankings());
 
 function renderWorkflowDetail(workflow) {
     elements.workflowDetail.hidden = false;
@@ -325,4 +443,6 @@ elements.form.addEventListener("submit", async event => {
 });
 
 void refreshDashboard();
+void refreshRankings();
 setInterval(refreshDashboard, refreshIntervalMs);
+setInterval(refreshRankings, rankingRefreshIntervalMs);

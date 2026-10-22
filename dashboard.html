@@ -71,6 +71,51 @@
                 <p class="form-status" id="provider-status" role="status" aria-live="polite">Offline settings last until the orchestrator restarts.</p>
         </section>
 
+        <section class="ranking-section" aria-labelledby="ranking-heading">
+            <div class="section-heading compact">
+                <div><p class="eyebrow">QUALITY & USAGE</p><h2 id="ranking-heading">Model & provider rankings</h2></div>
+                <div class="ranking-filters">
+                    <div class="segmented-control" id="ranking-skill" role="group" aria-label="Ranking task">
+                        <button type="button" data-skill="coding" aria-pressed="true">Coding</button>
+                        <button type="button" data-skill="thinking" aria-pressed="false">Thinking</button>
+                    </div>
+                    <label class="size-filter">Request size
+                        <select id="ranking-size">
+                            <option value="small">Small</option>
+                            <option value="medium" selected>Medium</option>
+                            <option value="large">Large</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div class="ranking-grid">
+                <div class="ranking-panel">
+                    <div class="ranking-panel-heading">
+                        <h3>Providers</h3>
+                        <span id="vendor-ranking-status" class="section-note">Loading…</span>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="ranking-table">
+                            <thead><tr><th>Rank</th><th>Provider</th><th>Score</th><th>Feedback</th><th>Active</th><th>Done · 24h</th><th>Failed · 24h</th><th>State</th></tr></thead>
+                            <tbody id="vendor-ranking-rows"><tr><td colspan="8" class="empty">Loading provider rankings…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="ranking-panel">
+                    <div class="ranking-panel-heading">
+                        <h3>Ollama models</h3>
+                        <span id="model-ranking-status" class="section-note">Loading…</span>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="ranking-table model-ranking-table">
+                            <thead><tr><th>Rank</th><th>Model</th><th>Score</th><th>Feedback</th><th>Active</th><th>Completed</th><th>Baseline</th></tr></thead>
+                            <tbody id="model-ranking-rows"><tr><td colspan="7" class="empty">Loading model rankings…</td></tr></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
         <section class="work-section" aria-labelledby="work-heading">
             <div class="section-heading compact">
                 <div><p class="eyebrow">RECENT ACTIVITY</p><h2 id="work-heading">Workflows & jobs</h2></div>
@@ -93,7 +138,7 @@
             </div>
             <div class="workflow-detail" id="workflow-detail" hidden></div>
         </section>
-        <footer><span>Orchestrator memory resets when the service restarts.</span><span id="refresh-note">Refreshes every 5 seconds</span></footer>
+        <footer><span>Orchestrator memory resets when the service restarts.</span><span id="refresh-note">Overview 5s · rankings 15s</span></footer>
     </main>
 </body>
 </html>
