@@ -24,7 +24,7 @@ function errorCode(code) {
     return error => error instanceof WorkspaceSnapshotError && error.code === code;
 }
 
-test("workspace snapshots are deterministic and change with allowlisted root files", t => {
+test("workspace snapshots are deterministic and change with included files", t => {
     const first = makeWorkspace(t);
     const second = makeWorkspace(t);
     fs.writeFileSync(path.join(first.root, "a.js"), "module.exports = 1;\n");
@@ -62,6 +62,25 @@ test("captured workspace bytes and digest metadata come from the same bounded sn
     }]);
 });
 
+test("recursive snapshots include nested text and binary files with portable relative names", t => {
+    const { root, stateDirectory } = makeWorkspace(t);
+    fs.mkdirSync(path.join(root, "src", "core"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".github"));
+    fs.mkdirSync(path.join(root, "assets"));
+    fs.writeFileSync(path.join(root, "src", "core", "module.ts"), "export const value = 1;\n");
+    fs.writeFileSync(path.join(root, ".github", "workflow.yml"), "name: build\n");
+    fs.writeFileSync(path.join(root, "assets", "icon.bin"), Buffer.from([0, 255, 1, 2]));
+
+    const captured = captureWorkspaceSnapshot(root, stateDirectory);
+
+    assert.deepEqual(captured.files.map(file => file.name), [
+        ".github/workflow.yml",
+        "assets/icon.bin",
+        "src/core/module.ts"
+    ]);
+    assert.deepEqual(captured.files.find(file => file.name === "assets/icon.bin").content, Buffer.from([0, 255, 1, 2]));
+});
+
 test("credentials, excluded directories, and state files are not fingerprinted", t => {
     const { root, stateDirectory } = makeWorkspace(t);
     fs.writeFileSync(path.join(root, "agent.js"), "module.exports = true;\n");
@@ -69,6 +88,10 @@ test("credentials, excluded directories, and state files are not fingerprinted",
     fs.writeFileSync(path.join(root, ".env"), "TOKEN=do-not-read\n");
     fs.writeFileSync(path.join(root, "auth.json"), "{\"token\":\"do-not-read\"}\n");
     fs.writeFileSync(path.join(root, "private.pem"), "private material\n");
+    fs.mkdirSync(path.join(root, "src", "credentials"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "credentials", "token.json"), "{\"token\":\"do-not-read\"}\n");
+    fs.mkdirSync(path.join(root, "src", ".env.local"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", ".env.local", "ignored.js"), "ignored\n");
     for (const directory of [".git", "node_modules", ".copilot-knowledge"]) {
         fs.mkdirSync(path.join(root, directory));
         fs.writeFileSync(path.join(root, directory, "hidden.js"), "ignored\n");
@@ -124,7 +147,7 @@ test("snapshot bounds fail closed for entries, files, and bytes", t => {
     );
 });
 
-test("symlinked allowlisted files are rejected", t => {
+test("nested symlinked files are rejected", t => {
     const { root, stateDirectory } = makeWorkspace(t);
     const target = path.join(root, "target-directory");
     fs.mkdirSync(target);
@@ -144,7 +167,7 @@ test("symlinked allowlisted files are rejected", t => {
     );
 });
 
-test("hardlinked allowlisted files are rejected", t => {
+test("nested hardlinked files are rejected", t => {
     const { root, stateDirectory } = makeWorkspace(t);
     const target = path.join(root, "source.js");
     fs.writeFileSync(target, "module.exports = 1;\n");

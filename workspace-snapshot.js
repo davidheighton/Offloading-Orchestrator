@@ -4,14 +4,18 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { createHash } = require("node:crypto");
 
-const snapshotAlgorithmVersion = 1;
+const snapshotAlgorithmVersion = 2;
 const snapshotLimits = Object.freeze({
-    maxEntries: 1000,
-    maxFiles: 500,
-    maxFileBytes: 256 * 1024,
-    maxTotalBytes: 2 * 1024 * 1024
+    maxEntries: 5000,
+    maxFiles: 2000,
+    maxFileBytes: 2 * 1024 * 1024,
+    maxTotalBytes: 20 * 1024 * 1024
 });
-const excludedDirectories = new Set([".git", "node_modules", ".copilot-knowledge"]);
+const {
+    excludedDirectories,
+    isCredentialRelativePath,
+    normalizeRelativePath
+} = require("./safe-relative-path");
 
 class WorkspaceSnapshotError extends Error {
     constructor(code) {
@@ -27,42 +31,8 @@ function translateFilesystemError(error, code) {
     throw error;
 }
 
-function normalizeName(name) {
-    if (!name ||
-        name.includes("\0") ||
-        name.includes("/") ||
-        name.includes("\\") ||
-        /[ .]$/.test(name)) {
-        throw new WorkspaceSnapshotError("snapshot-unsafe-name");
-    }
-    const normalized = name.normalize("NFC");
-    const canonical = normalized.toLowerCase();
-    if (!canonical || canonical === "." || canonical === ".." || /^[a-z]:/.test(canonical)) {
-        throw new WorkspaceSnapshotError("snapshot-unsafe-name");
-    }
-    return normalized;
-}
-
-function isCredentialName(name) {
-    return name === ".env" ||
-        name.startsWith(".env.") ||
-        name === ".npmrc" ||
-        name === ".netrc" ||
-        name === ".pypirc" ||
-        name === ".git-credentials" ||
-        name === "auth.json" ||
-        name.endsWith("-auth-state.json") ||
-        name.startsWith("id_rsa") ||
-        name.startsWith("id_ed25519") ||
-        /\.(?:pem|key|p12|pfx|kdbx)$/.test(name);
-}
-
 function hasReparsePoint(stat) {
     return Number.isInteger(stat.attributes) && (stat.attributes & 0x400) !== 0;
-}
-
-function isIncludedName(name) {
-    return name === "package.json" || name.endsWith(".js") || name.startsWith("readme");
 }
 
 function sameFileMetadata(left, right) {
@@ -135,17 +105,37 @@ function hashFile(filePath, before) {
     }
 }
 
-function readRootEntries(root, maximumEntries) {
+function readDirectoryEntries(directory, counters, limits, countEntries = true) {
     let entries;
     try {
-        entries = fs.readdirSync(root, { withFileTypes: true });
+        entries = fs.readdirSync(directory, { withFileTypes: true });
     } catch (error) {
-        translateFilesystemError(error, "snapshot-root-unreadable");
+        translateFilesystemError(error, "snapshot-directory-unreadable");
     }
-    if (entries.length > maximumEntries) {
+    if (countEntries) counters.entryCount += entries.length;
+    if (counters.entryCount > limits.maxEntries) {
         throw new WorkspaceSnapshotError("snapshot-too-many-entries");
     }
     return entries;
+}
+
+function safeRelativeName(name) {
+    try {
+        return normalizeRelativePath(name);
+    } catch {
+        throw new WorkspaceSnapshotError("snapshot-unsafe-name");
+    }
+}
+
+function pathsOverlap(left, right) {
+    const contains = (parent, child) => {
+        const relative = path.relative(parent, child);
+        return relative === "" ||
+            (relative !== ".." &&
+                !relative.startsWith(`..${path.sep}`) &&
+                !path.isAbsolute(relative));
+    };
+    return contains(left, right) || contains(right, left);
 }
 
 function captureWorkspaceSnapshot(workspacePath, stateDirectory, requestedLimits = {}) {
@@ -162,14 +152,16 @@ function captureWorkspaceSnapshot(workspacePath, stateDirectory, requestedLimits
     } catch (error) {
         translateFilesystemError(error, "snapshot-root-unavailable");
     }
-    let stateRoot;
-    try {
-        stateRoot = fs.realpathSync(stateDirectory);
-    } catch (error) {
-        translateFilesystemError(error, "snapshot-state-directory-unavailable");
-    }
-    if (path.relative(root, stateRoot) === "") {
-        throw new WorkspaceSnapshotError("snapshot-state-directory-overlaps-workspace");
+    if (stateDirectory !== null) {
+        let stateRoot;
+        try {
+            stateRoot = fs.realpathSync(stateDirectory);
+        } catch (error) {
+            translateFilesystemError(error, "snapshot-state-directory-unavailable");
+        }
+        if (pathsOverlap(root, stateRoot)) {
+            throw new WorkspaceSnapshotError("snapshot-state-directory-overlaps-workspace");
+        }
     }
 
     let beforeRoot;
@@ -181,74 +173,101 @@ function captureWorkspaceSnapshot(workspacePath, stateDirectory, requestedLimits
     if (!beforeRoot.isDirectory() || beforeRoot.isSymbolicLink() || hasReparsePoint(beforeRoot)) {
         throw new WorkspaceSnapshotError("snapshot-root-unavailable");
     }
-    const entries = readRootEntries(root, limits.maxEntries);
-    const names = [];
-    const canonicalNames = new Set();
     const files = [];
     const fileIdentities = new Set();
-    let totalBytes = 0;
+    const canonicalPaths = new Set();
+    const counters = { entryCount: 0, totalBytes: 0 };
 
-    for (const entry of entries) {
-        const normalizedName = normalizeName(entry.name);
-        const canonicalName = normalizedName.toLowerCase();
-        if (canonicalNames.has(canonicalName)) {
-            throw new WorkspaceSnapshotError("snapshot-case-collision");
+    function captureDirectory(directoryPath, relativeDirectory, beforeDirectory) {
+        const entries = readDirectoryEntries(directoryPath, counters, limits);
+        const beforeNames = [];
+        for (const entry of entries) {
+            const relativeName = safeRelativeName(
+                relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name
+            );
+            const canonicalName = relativeName.toLowerCase();
+            if (canonicalPaths.has(canonicalName)) {
+                throw new WorkspaceSnapshotError("snapshot-case-collision");
+            }
+            canonicalPaths.add(canonicalName);
+            beforeNames.push(relativeName);
+
+            const leafName = relativeName.slice(relativeName.lastIndexOf("/") + 1).toLowerCase();
+            if (excludedDirectories.has(leafName)) continue;
+            const filePath = path.join(directoryPath, entry.name);
+            let stat;
+            try {
+                stat = fs.lstatSync(filePath);
+            } catch (error) {
+                translateFilesystemError(error, "snapshot-read-race");
+            }
+            if (stat.isSymbolicLink() || hasReparsePoint(stat)) {
+                throw new WorkspaceSnapshotError("snapshot-symlink");
+            }
+            if (stat.isDirectory()) {
+                if (!isCredentialRelativePath(relativeName)) {
+                    captureDirectory(filePath, relativeName, stat);
+                }
+                continue;
+            }
+            if (isCredentialRelativePath(relativeName)) continue;
+            if (!stat.isFile()) throw new WorkspaceSnapshotError("snapshot-unsupported-object");
+            if (!Number.isFinite(stat.ino) || stat.ino === 0 || !Number.isFinite(stat.dev)) {
+                throw new WorkspaceSnapshotError("snapshot-file-identity-unavailable");
+            }
+            if (stat.nlink > 1) throw new WorkspaceSnapshotError("snapshot-hardlink");
+            if (stat.size > limits.maxFileBytes) {
+                throw new WorkspaceSnapshotError("snapshot-file-too-large");
+            }
+            counters.totalBytes += stat.size;
+            if (counters.totalBytes > limits.maxTotalBytes) {
+                throw new WorkspaceSnapshotError("snapshot-too-large");
+            }
+            if (files.length >= limits.maxFiles) {
+                throw new WorkspaceSnapshotError("snapshot-too-many-files");
+            }
+
+            const identity = `${stat.dev}:${stat.ino}`;
+            if (fileIdentities.has(identity)) throw new WorkspaceSnapshotError("snapshot-hardlink");
+            fileIdentities.add(identity);
+            const hashedFile = hashFile(filePath, stat);
+            files.push({
+                name: relativeName,
+                size: stat.size,
+                digest: hashedFile.digest,
+                content: hashedFile.content
+            });
         }
-        names.push(normalizedName);
-        canonicalNames.add(canonicalName);
-        if (excludedDirectories.has(canonicalName) || isCredentialName(canonicalName)) continue;
-        if (!isIncludedName(canonicalName)) continue;
 
-        const filePath = path.join(root, entry.name);
-        let stat;
+        const afterNames = readDirectoryEntries(directoryPath, counters, limits, false)
+            .map(entry => safeRelativeName(
+                relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name
+            ))
+            .sort();
+        let afterDirectory;
         try {
-            stat = fs.lstatSync(filePath);
+            afterDirectory = fs.lstatSync(directoryPath);
         } catch (error) {
             translateFilesystemError(error, "snapshot-read-race");
         }
-        if (stat.isSymbolicLink() || hasReparsePoint(stat)) {
-            throw new WorkspaceSnapshotError("snapshot-symlink");
+        if (JSON.stringify(beforeNames.sort()) !== JSON.stringify(afterNames) ||
+            !sameDirectoryMetadata(beforeDirectory, afterDirectory) ||
+            afterDirectory.isSymbolicLink() ||
+            hasReparsePoint(afterDirectory)) {
+            throw new WorkspaceSnapshotError("snapshot-read-race");
         }
-        if (!stat.isFile()) throw new WorkspaceSnapshotError("snapshot-unsupported-object");
-        if (!Number.isFinite(stat.ino) || stat.ino === 0 || !Number.isFinite(stat.dev)) {
-            throw new WorkspaceSnapshotError("snapshot-file-identity-unavailable");
-        }
-        if (stat.nlink > 1) throw new WorkspaceSnapshotError("snapshot-hardlink");
-        if (stat.size > limits.maxFileBytes) {
-            throw new WorkspaceSnapshotError("snapshot-file-too-large");
-        }
-        totalBytes += stat.size;
-        if (totalBytes > limits.maxTotalBytes) {
-            throw new WorkspaceSnapshotError("snapshot-too-large");
-        }
-        if (files.length >= limits.maxFiles) {
-            throw new WorkspaceSnapshotError("snapshot-too-many-files");
-        }
-
-        const identity = `${stat.dev}:${stat.ino}`;
-        if (fileIdentities.has(identity)) throw new WorkspaceSnapshotError("snapshot-hardlink");
-        fileIdentities.add(identity);
-        const hashedFile = hashFile(filePath, stat);
-        files.push({
-            name: normalizedName,
-            size: stat.size,
-            digest: hashedFile.digest,
-            content: hashedFile.content
-        });
     }
 
-    const afterEntries = readRootEntries(root, limits.maxEntries)
-        .map(entry => normalizeName(entry.name))
-        .sort();
-    const beforeNames = [...names].sort();
+    captureDirectory(root, "", beforeRoot);
     let afterRoot;
     try {
         afterRoot = fs.lstatSync(root);
     } catch (error) {
         translateFilesystemError(error, "snapshot-read-race");
     }
-    if (JSON.stringify(beforeNames) !== JSON.stringify(afterEntries) ||
-        !sameDirectoryMetadata(beforeRoot, afterRoot)) {
+    if (!sameDirectoryMetadata(beforeRoot, afterRoot) ||
+        afterRoot.isSymbolicLink() ||
+        hasReparsePoint(afterRoot)) {
         throw new WorkspaceSnapshotError("snapshot-read-race");
     }
 
@@ -259,7 +278,7 @@ function captureWorkspaceSnapshot(workspacePath, stateDirectory, requestedLimits
         algorithmVersion: snapshotAlgorithmVersion,
         hash: digest.digest("hex"),
         fileCount: files.length,
-        totalBytes
+        totalBytes: counters.totalBytes
     };
     return {
         workspaceRoot: root,

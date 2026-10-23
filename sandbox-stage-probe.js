@@ -23,11 +23,20 @@ function matchesDirectoryIdentity(directory, expected) {
     return actual.dev === expected.dev && actual.ino === expected.ino;
 }
 
-function createSyntheticProposal(baseSnapshot) {
-    const lines = [
-        'const assert = require("node:assert/strict");',
-        "assert.equal(true, true);"
-    ];
+function createSyntheticProposal(baseSnapshot, evaluateCandidate) {
+    const lines = evaluateCandidate
+        ? [
+            'const test = require("node:test");',
+            'const assert = require("node:assert/strict");',
+            'const candidateDiff = require("./candidate-diff");',
+            'test("staged source can be tested in the evaluator", () => {',
+            '    assert.equal(candidateDiff.candidateTestFilename, "improvement-loop.candidate.test.js");',
+            "});"
+        ]
+        : [
+            'const assert = require("node:assert/strict");',
+            "assert.equal(true, true);"
+        ];
     const proposalText = [
         `diff --git a/${candidateTestFilename} b/${candidateTestFilename}`,
         "new file mode 100644",
@@ -47,6 +56,11 @@ function createSyntheticProposal(baseSnapshot) {
             status: "eligible-for-sandbox-review",
             reasonCode: null,
             target: candidateTestFilename,
+            files: [{
+                path: candidateTestFilename,
+                operation: "add",
+                baseDigest: null
+            }],
             addedLineCount: lines.length,
             baseSnapshotHash: baseSnapshot.hash,
             currentSnapshotHash: baseSnapshot.hash
@@ -57,7 +71,7 @@ function createSyntheticProposal(baseSnapshot) {
     };
 }
 
-function runStageProbe() {
+function runStageProbe({ evaluateCandidate = false } = {}) {
     const workspacePath = path.resolve(__dirname);
     const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-stage-probe-"));
     const stateIdentity = getDirectoryIdentity(stateDirectory);
@@ -67,14 +81,17 @@ function runStageProbe() {
 
     try {
         const baseSnapshot = computeWorkspaceSnapshot(workspacePath, stateDirectory);
-        const proposal = createSyntheticProposal(baseSnapshot);
+        const proposal = createSyntheticProposal(baseSnapshot, evaluateCandidate);
         stagedWorkspace = createSandboxWorkspace({
             workspacePath,
             stateDirectory,
             baseSnapshot,
             proposal
         });
-        result = createSandboxStageTransferProbe().run(stagedWorkspace);
+        const probe = createSandboxStageTransferProbe();
+        result = evaluateCandidate
+            ? probe.evaluate(stagedWorkspace)
+            : probe.run(stagedWorkspace);
     } catch (error) {
         failure = error;
     } finally {
@@ -106,6 +123,10 @@ function runStageProbe() {
     return result;
 }
 
+function runStageEvaluationProbe() {
+    return runStageProbe({ evaluateCandidate: true });
+}
+
 if (require.main === module) {
     try {
         console.log(JSON.stringify(runStageProbe(), null, 2));
@@ -123,4 +144,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { runStageProbe };
+module.exports = { runStageProbe, runStageEvaluationProbe };

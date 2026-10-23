@@ -15,7 +15,7 @@ const sensitivePatterns = [
 ];
 
 function isSensitiveFile(relativePath) {
-    return relativePath.split(path.sep).some(part => {
+    return relativePath.split(/[\\/]/).some(part => {
         const name = part.toLowerCase();
         return name.startsWith(".env") ||
             /(^|[._-])(secret|secrets|credential|credentials|private|token)([._-]|$)/i.test(name) ||

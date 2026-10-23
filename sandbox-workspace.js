@@ -3,8 +3,18 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash } = require("node:crypto");
-const { candidateTestFilename, parseCandidateTestDiff } = require("./candidate-diff");
-const { hasSensitiveContent, isSensitiveFile } = require("./sensitive-text");
+const {
+    applyProposalFileChange,
+    candidateTestFilename,
+    parseProposalDiff
+} = require("./candidate-diff");
+const { hasSensitiveContent } = require("./sensitive-text");
+const {
+    excludedDirectories,
+    hasRelativePathCollision,
+    isCredentialRelativePath,
+    normalizeRelativePath
+} = require("./safe-relative-path");
 const {
     captureWorkspaceSnapshot,
     computeWorkspaceSnapshot,
@@ -15,8 +25,8 @@ const {
 
 const stagingDirectoryName = "sandbox-staging";
 const stagingPrefix = "candidate-";
-const maximumProposalDiffBytes = 4 * 1024;
-const maximumManifestBytes = 32 * 1024;
+const maximumProposalDiffBytes = 256 * 1024;
+const maximumManifestBytes = 1024 * 1024;
 const maximumStagingEntries = 1000;
 const staleStagingTtlMs = 24 * 60 * 60 * 1000;
 const maximumWindowsPathLength = 240;
@@ -109,31 +119,42 @@ function validateProposal(proposal, baseSnapshot) {
         preflight.schemaVersion !== 1 ||
         preflight.status !== "eligible-for-sandbox-review" ||
         preflight.reasonCode !== null ||
-        preflight.target !== candidateTestFilename ||
         preflight.baseSnapshotHash !== baseSnapshot.hash ||
         preflight.currentSnapshotHash !== baseSnapshot.hash ||
+        !Array.isArray(preflight.files) ||
+        preflight.files.length < 1 ||
+        preflight.files.length > 100 ||
         !Number.isInteger(preflight.addedLineCount) ||
-        preflight.addedLineCount < 1 ||
-        preflight.addedLineCount > 200 ||
+        preflight.addedLineCount < 0 ||
         typeof proposal.proposalText !== "string" ||
         Buffer.byteLength(proposal.proposalText, "utf8") > maximumProposalDiffBytes) {
         throw new SandboxWorkspaceError("proposal-preflight-invalid");
     }
-    const parsedDiff = parseCandidateTestDiff(proposal.proposalText);
+    const parsedDiff = parseProposalDiff(proposal.proposalText);
     if (!parsedDiff.eligible ||
-        parsedDiff.target !== preflight.target ||
-        parsedDiff.addedLineCount !== preflight.addedLineCount) {
+        parsedDiff.addedLineCount !== preflight.addedLineCount ||
+        parsedDiff.files.length !== preflight.files.length ||
+        parsedDiff.files.some((file, index) => {
+            const expected = preflight.files[index];
+            return !expected ||
+                expected.path !== file.path ||
+                expected.operation !== file.operation ||
+                (file.operation === "add"
+                    ? expected.baseDigest !== null
+                    : !/^[a-f0-9]{64}$/.test(expected.baseDigest || ""));
+        })) {
         throw new SandboxWorkspaceError("proposal-diff-invalid");
     }
-    const candidateBuffer = Buffer.from(parsedDiff.sourceText, "utf8");
-    if (candidateBuffer.toString("utf8") !== parsedDiff.sourceText ||
-        parsedDiff.sourceText.charCodeAt(0) === 0xfeff ||
-        hasSensitiveContent(parsedDiff.sourceText, { allowCodeExpressions: true })) {
+    const addedText = parsedDiff.files
+        .flatMap(file => file.hunks.flatMap(hunk =>
+            hunk.lines.filter(line => line.kind === "+").map(line => line.text)
+        ))
+        .join("\n");
+    if (hasSensitiveContent(addedText, { allowCodeExpressions: true })) {
         throw new SandboxWorkspaceError("candidate-content-rejected");
     }
     return {
-        candidateText: parsedDiff.sourceText,
-        candidateBuffer,
+        parsedDiff,
         proposalDigest: createHash("sha256").update(proposal.proposalText, "utf8").digest("hex")
     };
 }
@@ -248,11 +269,89 @@ function writeExclusiveFile(destination, content, code) {
 }
 
 function writeStagedFile(stageDirectory, name, content) {
-    const destination = path.resolve(stageDirectory, name);
-    if (path.dirname(destination) !== stageDirectory) {
+    let normalizedName;
+    try {
+        normalizedName = normalizeRelativePath(name);
+    } catch {
         throw new SandboxWorkspaceError("staging-path-invalid");
     }
+    const segments = normalizedName.split("/");
+    const destination = path.resolve(stageDirectory, ...segments);
+    if (!isStrictDescendant(stageDirectory, destination) ||
+        destination.length > maximumWindowsPathLength) {
+        throw new SandboxWorkspaceError("staging-path-invalid");
+    }
+    let parent = stageDirectory;
+    for (const segment of segments.slice(0, -1)) {
+        parent = path.join(parent, segment);
+        try {
+            fs.mkdirSync(parent, { mode: 0o700 });
+        } catch (error) {
+            if (error.code !== "EEXIST") {
+                throw new SandboxWorkspaceError("staging-directory-create-failed", error);
+            }
+        }
+        const stat = fs.lstatSync(parent);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || hasReparsePoint(stat) ||
+            !isStrictDescendant(stageDirectory, fs.realpathSync(parent))) {
+            throw new SandboxWorkspaceError("staging-path-invalid");
+        }
+    }
     writeExclusiveFile(destination, content, "staging-file-write-failed");
+}
+
+function listStagingEntries(stageDirectory) {
+    const entries = [];
+    function visit(directory, relativeDirectory) {
+        let children;
+        try {
+            children = fs.readdirSync(directory);
+        } catch (error) {
+            throw new SandboxWorkspaceError("staging-directory-unreadable", error);
+        }
+        for (const child of children) {
+            let relativePath;
+            try {
+                relativePath = normalizeRelativePath(
+                    relativeDirectory ? `${relativeDirectory}/${child}` : child
+                );
+            } catch {
+                throw new SandboxWorkspaceError("staging-path-invalid");
+            }
+            const childPath = path.join(directory, child);
+            let stat;
+            try {
+                stat = fs.lstatSync(childPath);
+            } catch (error) {
+                throw new SandboxWorkspaceError("staging-entry-identity-unavailable", error);
+            }
+            if (stat.isSymbolicLink() || hasReparsePoint(stat)) {
+                throw new SandboxWorkspaceError("staging-symlink");
+            }
+            if (stat.isDirectory()) {
+                entries.push(`d:${relativePath}`);
+                visit(childPath, relativePath);
+            } else if (stat.isFile() && stat.nlink === 1) {
+                entries.push(`f:${relativePath}`);
+            } else {
+                throw new SandboxWorkspaceError("staging-unsupported-object");
+            }
+        }
+    }
+    visit(stageDirectory, "");
+    return entries.sort();
+}
+
+function expectedStagingEntries(files) {
+    const expected = new Set();
+    for (const file of files) {
+        expected.add(`f:${file.name}`);
+        const segments = file.name.split("/");
+        for (let index = 1; index < segments.length; index++) {
+            expected.add(`d:${segments.slice(0, index).join("/")}`);
+        }
+    }
+    return [...expected].sort();
 }
 
 function verifyManifestFile(manifestPath, expectedIdentity, manifest) {
@@ -284,19 +383,13 @@ function verifyStagedDirectory(
 ) {
     ensureDirectoryIdentity(stagingRoot, stagingRootIdentity);
     ensureDirectoryIdentity(stageDirectory, stageIdentity);
-    let entries;
-    try {
-        entries = fs.readdirSync(stageDirectory).sort();
-    } catch (error) {
-        throw new SandboxWorkspaceError("staging-directory-unreadable", error);
-    }
-    const expectedNames = manifest.files.map(file => file.name).sort();
-    if (JSON.stringify(entries) !== JSON.stringify(expectedNames)) {
+    const actualEntries = listStagingEntries(stageDirectory);
+    if (JSON.stringify(actualEntries) !== JSON.stringify(expectedStagingEntries(manifest.files))) {
         throw new SandboxWorkspaceError("staging-file-set-changed");
     }
     let captured;
     try {
-        captured = captureWorkspaceSnapshot(stageDirectory, stateRoot);
+        captured = captureWorkspaceSnapshot(stageDirectory, null);
     } catch (error) {
         throw snapshotFailure(error);
     }
@@ -397,22 +490,118 @@ function cleanupStaleSandboxWorkspaces(stateDirectory, now = Date.now()) {
 }
 
 function validateStagedSource(sourceFiles) {
-    const stagedFiles = sourceFiles
-        .filter(file => file.name.endsWith(".js") && !/(?:\.test|\.spec)\.js$/i.test(file.name))
+    const stagedFiles = [...sourceFiles]
         .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
     if (stagedFiles.length === 0) throw new SandboxWorkspaceError("staging-source-empty");
     for (const file of stagedFiles) {
-        if (isSensitiveFile(file.name)) {
+        let normalizedName;
+        try {
+            normalizedName = normalizeRelativePath(file.name);
+        } catch {
+            throw new SandboxWorkspaceError("staging-path-invalid");
+        }
+        if (normalizedName !== file.name ||
+            isCredentialRelativePath(file.name) ||
+            file.name.split("/").some(part => excludedDirectories.has(part.toLowerCase()))) {
             throw new SandboxWorkspaceError("sensitive-filename-in-snapshot");
         }
+        if (!Buffer.isBuffer(file.content) ||
+            createHash("sha256").update(file.content).digest("hex") !== file.digest) {
+            throw new SandboxWorkspaceError("source-content-changed-after-snapshot");
+        }
+        const referenceOnlyPath = /\.(?:md|mdx|rst|txt|adoc)$/i.test(file.name) ||
+            file.name.split("/").some(part =>
+                /^(?:tests?|specs?|fixtures?|examples?)$/i.test(part) ||
+                /\.(?:test|spec)\.[^.]+$/i.test(part)
+            );
         const text = file.content.toString("utf8");
-        if (Buffer.from(text, "utf8").compare(file.content) !== 0 ||
-            text.charCodeAt(0) === 0xfeff ||
-            hasSensitiveContent(text, { allowCodeExpressions: true })) {
+        if (!referenceOnlyPath &&
+            Buffer.from(text, "utf8").compare(file.content) === 0 &&
+            !text.includes("\0") &&
+            (text.charCodeAt(0) === 0xfeff ||
+                hasSensitiveContent(text, { allowCodeExpressions: true }))) {
             throw new SandboxWorkspaceError("sensitive-or-invalid-source-content");
         }
     }
     return stagedFiles;
+}
+
+function applyProposalChanges(sourceFiles, parsedDiff, preflightFiles) {
+    const sourceByPath = new Map(sourceFiles.map(file => [file.name.toLowerCase(), file]));
+    const resultByPath = new Map(sourceFiles.map(file => [file.name, {
+        name: file.name,
+        content: Buffer.from(file.content),
+        origin: "snapshot"
+    }]));
+
+    for (const [index, change] of parsedDiff.files.entries()) {
+        const preflight = preflightFiles[index];
+        const canonicalPath = change.path.toLowerCase();
+        const existing = sourceByPath.get(canonicalPath);
+        if (change.operation === "add") {
+            if (existing) throw new SandboxWorkspaceError("proposal-target-already-exists");
+            let content;
+            try {
+                content = applyProposalFileChange(change, null);
+            } catch (error) {
+                throw new SandboxWorkspaceError("proposal-patch-invalid", error);
+            }
+            resultByPath.set(change.path, { name: change.path, content, origin: "proposal" });
+            continue;
+        }
+        if (!existing ||
+            existing.name !== change.path ||
+            existing.digest !== preflight.baseDigest) {
+            throw new SandboxWorkspaceError("proposal-base-file-mismatch");
+        }
+        let content;
+        try {
+            content = applyProposalFileChange(change, Buffer.from(existing.content));
+        } catch (error) {
+            throw new SandboxWorkspaceError("proposal-patch-does-not-match-base", error);
+        }
+        resultByPath.delete(existing.name);
+        if (change.operation !== "delete") {
+            resultByPath.set(change.path, { name: change.path, content, origin: "proposal" });
+        }
+    }
+
+    const result = [...resultByPath.values()].sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    );
+    if (result.length === 0 || result.length > snapshotLimits.maxFiles) {
+        throw new SandboxWorkspaceError("staging-limits-exceeded");
+    }
+    if (hasRelativePathCollision(result.map(file => file.name))) {
+        throw new SandboxWorkspaceError("staging-path-collision-or-exclusion");
+    }
+    let totalBytes = 0;
+    const names = new Set();
+    for (const file of result) {
+        let normalizedName;
+        try {
+            normalizedName = normalizeRelativePath(file.name);
+        } catch {
+            throw new SandboxWorkspaceError("staging-path-invalid");
+        }
+        const canonicalName = normalizedName.toLowerCase();
+        if (canonicalName !== file.name.toLowerCase() ||
+            names.has(canonicalName) ||
+            isCredentialRelativePath(file.name) ||
+            file.name.split("/").some(part => excludedDirectories.has(part.toLowerCase()))) {
+            throw new SandboxWorkspaceError("staging-path-collision-or-exclusion");
+        }
+        names.add(canonicalName);
+        if (!Buffer.isBuffer(file.content) || file.content.length > snapshotLimits.maxFileBytes) {
+            throw new SandboxWorkspaceError("staging-limits-exceeded");
+        }
+        totalBytes += file.content.length;
+        if (totalBytes > snapshotLimits.maxTotalBytes) {
+            throw new SandboxWorkspaceError("staging-limits-exceeded");
+        }
+        file.digest = createHash("sha256").update(file.content).digest("hex");
+    }
+    return result;
 }
 
 function createSandboxWorkspace({
@@ -442,12 +631,12 @@ function createSandboxWorkspace({
     if (pathsOverlap(sourceCapture.workspaceRoot, stateRoot)) {
         throw new SandboxWorkspaceError("staging-root-overlaps-workspace");
     }
-    const candidateName = candidateTestFilename.toLowerCase();
-    if (sourceCapture.files.some(file => file.name.toLowerCase() === candidateName)) {
-        throw new SandboxWorkspaceError("candidate-already-present-in-snapshot");
-    }
-
     const sourceFiles = validateStagedSource(sourceCapture.files);
+    const stagedContent = applyProposalChanges(
+        sourceFiles,
+        validatedProposal.parsedDiff,
+        proposal.staticPreflight.files
+    );
     const stagedRoot = ensureStagingRoot(stateRoot, true);
     if (!isStrictDescendant(stateRoot, stagedRoot) ||
         pathsOverlap(sourceCapture.workspaceRoot, stagedRoot)) {
@@ -467,22 +656,19 @@ function createSandboxWorkspace({
             pathsOverlap(realStageDirectory, sourceCapture.workspaceRoot)) {
             throw new SandboxWorkspaceError("staging-directory-location-invalid");
         }
-        if (realStageDirectory.length + candidateTestFilename.length + 1 > maximumWindowsPathLength) {
+        if (stagedContent.some(file =>
+            path.resolve(realStageDirectory, ...file.name.split("/")).length > maximumWindowsPathLength
+        )) {
             throw new SandboxWorkspaceError("staging-path-too-long");
         }
         stageIdentity = directoryIdentity(realStageDirectory);
         stageDirectory = realStageDirectory;
 
         const stagedFiles = [];
-        for (const file of sourceFiles) {
-            if (createHash("sha256").update(file.content).digest("hex") !== file.digest) {
-                throw new SandboxWorkspaceError("source-content-changed-after-snapshot");
-            }
+        for (const file of stagedContent) {
             writeStagedFile(stageDirectory, file.name, file.content);
-            stagedFiles.push(digestFile(file.name, file.content, "snapshot"));
+            stagedFiles.push(digestFile(file.name, file.content, file.origin));
         }
-        writeStagedFile(stageDirectory, candidateTestFilename, validatedProposal.candidateBuffer);
-        stagedFiles.push(digestFile(candidateTestFilename, validatedProposal.candidateBuffer, "proposal"));
 
         const afterCopy = captureWorkspaceSnapshot(workspacePath, stateDirectory);
         if (afterCopy.snapshot.hash !== baseSnapshot.hash) {
@@ -499,6 +685,11 @@ function createSandboxWorkspace({
         }
         const stageName = path.basename(stageDirectory);
         manifestPath = path.join(stagedRoot, `${stageName}.manifest.json`);
+        const candidateChange = validatedProposal.parsedDiff.files.find(file =>
+            file.path === candidateTestFilename && file.operation !== "delete"
+        );
+        const candidateEntry = candidateChange &&
+            manifestFiles.find(file => file.name === candidateTestFilename);
         const manifest = Object.freeze({
             schemaVersion: 1,
             algorithmVersion: snapshotAlgorithmVersion,
@@ -509,16 +700,22 @@ function createSandboxWorkspace({
             sourceSnapshotHash: baseSnapshot.hash,
             stagedSnapshot,
             proposalDigest: validatedProposal.proposalDigest,
-            candidateFile: candidateTestFilename,
-            candidateDigest: manifestFiles.find(file => file.origin === "proposal").digest,
+            candidateFile: candidateEntry ? candidateTestFilename : null,
+            candidateDigest: candidateEntry?.digest || null,
+            proposalFiles: Object.freeze(validatedProposal.parsedDiff.files.map((change, index) => {
+                const resultFile = manifestFiles.find(file => file.name === change.path);
+                return Object.freeze({
+                    path: change.path,
+                    operation: change.operation,
+                    baseDigest: proposal.staticPreflight.files[index].baseDigest,
+                    resultDigest: change.operation === "delete" ? null : resultFile?.digest || null
+                });
+            })),
             files: Object.freeze(manifestFiles.map(file => Object.freeze({ ...file }))),
             excluded: Object.freeze([
-                "package.json",
-                "readme-files",
-                "test-files",
-                "spec-files",
-                "dependencies",
-                "hidden-directories",
+                ".git",
+                "node_modules",
+                ".copilot-knowledge",
                 "credential-like-filenames"
             ])
         });

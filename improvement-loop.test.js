@@ -5,6 +5,7 @@ const path = require("node:path");
 const { createHash } = require("node:crypto");
 const test = require("node:test");
 const { createImprovementLoop, parseArguments } = require("./improvement-loop");
+const { captureWorkspaceSnapshot } = require("./workspace-snapshot");
 
 const validConfiguration = {
     confirmedProviderSharing: true,
@@ -333,7 +334,7 @@ test("advice advances to a bounded code proposal, which is stored but never appl
     assert.equal(proposalSubmission.pendingProviderCalls, 2);
     assert.equal(proposalSubmission.usage.providerCalls, 5);
     const proposalRequest = JSON.parse(fixture.calls[3].options.body);
-    assert.equal(proposalRequest.goal, "Create one test-only proposal for the prior reliability advice. Do not apply it, run commands, or claim validation.");
+    assert.equal(proposalRequest.goal, "Create a bounded, multi-file implementation proposal for the prior reliability advice. Do not apply it, run commands, or claim validation.");
     assert.equal(proposalRequest.synthesisProvider, "claude");
     assert.deepEqual(proposalRequest.threads.map(thread => ({
         type: thread.type,
@@ -341,7 +342,7 @@ test("advice advances to a bounded code proposal, which is stored but never appl
         required: thread.required
     })), [{ type: "coding", provider: "claude", required: true }]);
     assert.match(proposalRequest.threads[0].prompt, /Add a regression test for the retry boundary/);
-    assert.match(proposalRequest.threads[0].prompt, /exactly one new root file named improvement-loop\.candidate\.test\.js/);
+    assert.match(proposalRequest.threads[0].prompt, /any coherent multi-file changes/);
     assert.doesNotMatch(JSON.stringify(proposalRequest), /\b(?:auto|ollama)\b/i);
 
     const deferredProposalPoll = await fixture.loop.tick();
@@ -386,12 +387,18 @@ test("advice advances to a bounded code proposal, which is stored but never appl
         status: proposalArtifact.staticPreflight.status,
         reasonCode: proposalArtifact.staticPreflight.reasonCode,
         target: proposalArtifact.staticPreflight.target,
+        files: proposalArtifact.staticPreflight.files,
         addedLineCount: proposalArtifact.staticPreflight.addedLineCount
     }, {
         schemaVersion: 1,
         status: "eligible-for-sandbox-review",
         reasonCode: null,
         target: candidateTestFilename,
+        files: [{
+            path: candidateTestFilename,
+            operation: "add",
+            baseDigest: null
+        }],
         addedLineCount: 1
     });
     assert.match(proposalArtifact.baseSnapshotHash, /^[a-f0-9]{64}$/);
@@ -401,6 +408,66 @@ test("advice advances to a bounded code proposal, which is stored but never appl
     assert.equal(proposalArtifact.validated, false);
     assert.equal(proposalArtifact.applied, false);
     assert.equal(proposalArtifact.sandboxTransfer, undefined);
+});
+
+test("multi-file nested proposals are accepted with locally captured base-file hashes", async t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+    fs.mkdirSync(path.join(fixture.workspaceDirectory, "src"), { recursive: true });
+    fs.mkdirSync(path.join(fixture.workspaceDirectory, "docs"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.workspaceDirectory, "src", "module.js"), "module.exports = 1;\n");
+    fs.writeFileSync(path.join(fixture.workspaceDirectory, "docs", "old.md"), "old documentation\n");
+    const base = captureWorkspaceSnapshot(fixture.workspaceDirectory, fixture.stateDirectory);
+    const diff = [
+        "diff --git a/src/module.js b/src/module.js",
+        "index 1234567..abcdef0 100644",
+        "--- a/src/module.js",
+        "+++ b/src/module.js",
+        "@@ -1 +1 @@",
+        "-module.exports = 1;",
+        "+module.exports = 2;",
+        "diff --git a/tests/nested/retry.spec.js b/tests/nested/retry.spec.js",
+        "new file mode 100644",
+        "--- /dev/null",
+        "+++ b/tests/nested/retry.spec.js",
+        "@@ -0,0 +1 @@",
+        "+assert.equal(require('../../src/module'), 2);",
+        "diff --git a/docs/old.md b/docs/old.md",
+        "deleted file mode 100644",
+        "--- a/docs/old.md",
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        "-old documentation"
+    ].join("\n");
+
+    const result = await completeProposal(fixture, makeProposalResponse(diff));
+    const proposal = JSON.parse(fs.readFileSync(
+        path.join(fixture.stateDirectory, "latest-proposal.json"),
+        "utf8"
+    ));
+
+    assert.equal(result.usage.cycles, 1);
+    assert.equal(result.phase, "context");
+    assert.equal(proposal.staticPreflight.status, "eligible-for-sandbox-review");
+    assert.equal(proposal.staticPreflight.target, null);
+    assert.deepEqual(proposal.staticPreflight.files.map(file => ({
+        path: file.path,
+        operation: file.operation
+    })), [
+        { path: "src/module.js", operation: "modify" },
+        { path: "tests/nested/retry.spec.js", operation: "add" },
+        { path: "docs/old.md", operation: "delete" }
+    ]);
+    assert.equal(
+        proposal.staticPreflight.files[0].baseDigest,
+        base.files.find(file => file.name === "src/module.js").digest
+    );
+    assert.equal(
+        proposal.staticPreflight.files[2].baseDigest,
+        base.files.find(file => file.name === "docs/old.md").digest
+    );
+    assert.equal(proposal.validated, false);
+    assert.equal(proposal.applied, false);
 });
 
 test("sandbox-probe requires confirmation and transfers only the latest verified proposal", async t => {
@@ -797,11 +864,11 @@ test("proposal output that claims tests ran is rejected", async t => {
     assert.equal(fs.existsSync(path.join(fixture.stateDirectory, "latest-proposal.json")), false);
 });
 
-test("static preflight rejects disallowed paths, existing targets, and mismatched hunk counts", async t => {
+test("static preflight rejects unsafe paths, existing targets, and malformed hunks", async t => {
     const cases = [
         {
-            diff: makeCandidateDiff(["test('retries once', () => {});"], "retry.test.js"),
-            reasonCode: "path-not-allowlisted"
+            diff: makeCandidateDiff(["test('retries once', () => {});"], "../retry.test.js"),
+            reasonCode: "unsafe-target-path"
         },
         {
             diff: makeCandidateDiff(["test('retries once', () => {});"]),
@@ -811,7 +878,7 @@ test("static preflight rejects disallowed paths, existing targets, and mismatche
         {
             diff: makeCandidateDiff(["test('retries once', () => {});"])
                 .replace("@@ -0,0 +1,1 @@", "@@ -0,0 +1,2 @@"),
-            reasonCode: "invalid-hunk-content"
+            reasonCode: "hunk-line-count-mismatch"
         }
     ];
 
@@ -1096,8 +1163,8 @@ test("oversized service responses are rejected without unbounded buffering", asy
         ok: true,
         body: new ReadableStream({
             start(controller) {
-                controller.enqueue(new Uint8Array(64 * 1024));
-                controller.enqueue(new Uint8Array(64 * 1024 + 1));
+                controller.enqueue(new Uint8Array(1024 * 1024));
+                controller.enqueue(new Uint8Array(1024 * 1024 + 1));
             }
         }),
         text: async () => {

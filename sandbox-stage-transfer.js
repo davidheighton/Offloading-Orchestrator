@@ -3,6 +3,13 @@
 const { createHash, randomUUID } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const { candidateTestFilename } = require("./candidate-diff");
+const {
+    excludedDirectories,
+    hasRelativePathCollision,
+    isCredentialRelativePath,
+    normalizeRelativePath
+} = require("./safe-relative-path");
+const { snapshotLimits } = require("./workspace-snapshot");
 
 const dockerContext = "desktop-linux";
 const dockerEndpoint = "npipe:////./pipe/dockerDesktopLinuxEngine";
@@ -12,17 +19,21 @@ const expectedImageId = imageDigest;
 const memoryLimitBytes = 256 * 1024 * 1024;
 const cpuLimitNanoCpus = 500000000;
 const processLimit = 32;
-const dockerCallTimeoutMs = 30000;
-const maxDockerOutputBytes = 256 * 1024;
-const maxTransferBytes = 2 * 1024 * 1024;
-const maxTransferFiles = 500;
-const tmpfsSize = "4m";
+const dockerCallTimeoutMs = 60000;
+const maxDockerOutputBytes = 2 * 1024 * 1024;
+const maxTransferBytes = snapshotLimits.maxTotalBytes;
+const maxTransferFiles = snapshotLimits.maxFiles;
+const maxTransferFileBytes = snapshotLimits.maxFileBytes;
+const maxTransferPayloadBytes = 32 * 1024 * 1024;
+const tmpfsSize = "32m";
+const evaluationTimeoutMs = 15000;
+const evaluationStreamLimitBytes = 8 * 1024;
 const idleScript = "setTimeout(() => process.exit(0), 300000)";
 const receiverScript = String.raw`
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const inputLimit = 3 * 1024 * 1024;
+const inputLimit = ${maxTransferPayloadBytes};
 const chunks = [];
 let inputBytes = 0;
 
@@ -37,7 +48,7 @@ process.stdin.on("end", () => {
     if (!payload ||
         !Array.isArray(payload.files) ||
         payload.files.length < 1 ||
-        payload.files.length > 500 ||
+        payload.files.length > ${maxTransferFiles} ||
         !/^[a-f0-9]{64}$/.test(payload.stagedSnapshotHash)) {
         throw new Error("invalid-transfer-manifest");
     }
@@ -45,17 +56,93 @@ process.stdin.on("end", () => {
     const root = "/tmp/stage";
     fs.mkdirSync(root, { mode: 0o700 });
     const names = new Set();
+    const fileNameKeys = new Set(payload.files.map(file =>
+        typeof file?.name === "string" ? file.name.toLowerCase() : ""
+    ));
+    const componentNames = new Map();
+    const directoryKeys = new Set();
     const files = [];
     let totalBytes = 0;
+    function safeRelativeName(name) {
+        if (typeof name !== "string" ||
+            name.length === 0 ||
+            name.length > 240 ||
+            name.includes("\\") ||
+            name.includes("\0") ||
+            name.startsWith("/") ||
+            /^[a-z]:/i.test(name) ||
+            name.normalize("NFC") !== name) return false;
+        const parts = name.split("/");
+        if (parts.length > 32 || parts.some(part =>
+            !part ||
+            part === "." ||
+            part === ".." ||
+            part.length > 255 ||
+            /[<>:"|?*\x00-\x1f]/.test(part) ||
+            /[ .]$/.test(part) ||
+            /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part) ||
+            ["${[...excludedDirectories].join('","')}"].includes(part.toLowerCase())
+        )) return false;
+        const sensitive = parts.some(part => {
+            const lower = part.toLowerCase();
+            return lower.startsWith(".env") ||
+                /(^|[._-])(secret|secrets|credential|credentials|private|token)([._-]|$)/i.test(lower) ||
+                lower === ".npmrc" ||
+                lower === ".netrc" ||
+                lower === ".pypirc" ||
+                lower === ".git-credentials" ||
+                lower === "auth.json" ||
+                lower.endsWith("-auth-state.json") ||
+                lower.startsWith("id_rsa") ||
+                lower.startsWith("id_ed25519") ||
+                /\.(?:pem|key|p12|pfx|kdbx)$/.test(lower);
+        });
+        return !sensitive;
+    }
+    function collectEntries(directory, relativeDirectory, result) {
+        for (const child of fs.readdirSync(directory)) {
+            const relativeName = relativeDirectory ? relativeDirectory + "/" + child : child;
+            const stat = fs.lstatSync(path.join(directory, child));
+            if (stat.isSymbolicLink()) throw new Error("transferred-symlink-detected");
+            if (stat.isDirectory()) {
+                result.push("d:" + relativeName);
+                collectEntries(path.join(directory, child), relativeName, result);
+            } else if (stat.isFile() && stat.nlink === 1) {
+                result.push("f:" + relativeName);
+            } else {
+                throw new Error("transferred-unsupported-object");
+            }
+        }
+    }
     for (const expected of payload.files) {
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,89}\.js$/.test(expected.name) ||
+        if (!safeRelativeName(expected.name) ||
             !Number.isSafeInteger(expected.size) ||
             expected.size < 0 ||
-            expected.size > 256 * 1024 ||
+            expected.size > ${maxTransferFileBytes} ||
             !/^[a-f0-9]{64}$/.test(expected.digest) ||
             typeof expected.contentBase64 !== "string" ||
-            names.has(expected.name.toLowerCase())) {
+            names.has(expected.name.toLowerCase()) ||
+            !normalizeNameMatches(expected.name)) {
             throw new Error("invalid-transfer-entry");
+        }
+        const parts = expected.name.split("/");
+        for (let index = 0; index < parts.length; index++) {
+            const prefix = parts.slice(0, index + 1).join("/");
+            const canonicalPrefix = prefix.toLowerCase();
+            const existingPrefix = componentNames.get(canonicalPrefix);
+            if (existingPrefix && existingPrefix !== prefix) {
+                throw new Error("transfer-path-case-collision");
+            }
+            componentNames.set(canonicalPrefix, prefix);
+            if (index < parts.length - 1) {
+                if (names.has(canonicalPrefix) || fileNameKeys.has(canonicalPrefix)) {
+                    throw new Error("transfer-file-directory-collision");
+                }
+                directoryKeys.add(canonicalPrefix);
+            }
+        }
+        if (directoryKeys.has(expected.name.toLowerCase())) {
+            throw new Error("transfer-file-directory-collision");
         }
         names.add(expected.name.toLowerCase());
         const content = Buffer.from(expected.contentBase64, "base64");
@@ -65,17 +152,41 @@ process.stdin.on("end", () => {
             throw new Error("transfer-input-content-mismatch");
         }
         totalBytes += content.length;
-        if (totalBytes > 2 * 1024 * 1024) throw new Error("transfer-size-limit-exceeded");
-        fs.writeFileSync(path.join(root, expected.name), content, { flag: "wx", mode: 0o444 });
+        if (totalBytes > ${maxTransferBytes}) throw new Error("transfer-size-limit-exceeded");
+        let directory = root;
+        for (const part of parts.slice(0, -1)) {
+            directory = path.join(directory, part);
+            try {
+                fs.mkdirSync(directory, { mode: 0o700 });
+            } catch (error) {
+                if (error.code !== "EEXIST") throw error;
+            }
+            const directoryStat = fs.lstatSync(directory);
+            if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+                throw new Error("transfer-parent-directory-mismatch");
+            }
+        }
+        const filePath = path.resolve(root, ...parts);
+        if (!filePath.startsWith(root + path.sep)) throw new Error("transfer-path-escape");
+        fs.writeFileSync(filePath, content, { flag: "wx", mode: 0o444 });
     }
 
-    const expectedNames = payload.files.map(file => file.name).sort();
-    const actualNames = fs.readdirSync(root).sort();
-    if (JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+    const expectedEntries = new Set();
+    for (const file of payload.files) {
+        expectedEntries.add("f:" + file.name);
+        const parts = file.name.split("/");
+        for (let index = 1; index < parts.length; index++) {
+            expectedEntries.add("d:" + parts.slice(0, index).join("/"));
+        }
+    }
+    const actualEntries = [];
+    collectEntries(root, "", actualEntries);
+    actualEntries.sort();
+    if (JSON.stringify(actualEntries) !== JSON.stringify([...expectedEntries].sort())) {
         throw new Error("transferred-file-set-mismatch");
     }
     for (const expected of payload.files) {
-        const filePath = path.join(root, expected.name);
+        const filePath = path.resolve(root, ...expected.name.split("/"));
         const stat = fs.lstatSync(filePath);
         if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
             stat.size !== expected.size || (stat.mode & 0o111) !== 0) {
@@ -94,6 +205,81 @@ process.stdin.on("end", () => {
         totalBytes
     }));
 });
+
+function normalizeNameMatches(name) {
+    try {
+        return name === name.normalize("NFC") &&
+            name.split("/").join("/") === normalizePath(name);
+    } catch {
+        return false;
+    }
+}
+
+function normalizePath(name) {
+    if (name.includes("\\") || path.posix.isAbsolute(name) || path.win32.isAbsolute(name)) {
+        return "";
+    }
+    return name;
+}
+`;
+
+const candidateEvaluationScript = String.raw`
+const { spawnSync } = require("node:child_process");
+const candidateFilename = "improvement-loop.candidate.test.js";
+const maximumStreamBytes = 8192;
+
+function boundedText(value) {
+    const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value || "");
+    return {
+        text: buffer.subarray(0, maximumStreamBytes).toString("utf8"),
+        truncated: buffer.length > maximumStreamBytes
+    };
+}
+
+let execution;
+try {
+    execution = spawnSync(process.execPath, [
+        "--test",
+        "--test-reporter=tap",
+        candidateFilename
+    ], {
+        cwd: "/tmp/stage",
+        env: { PATH: process.env.PATH || "" },
+        shell: false,
+        timeout: ${evaluationTimeoutMs},
+        maxBuffer: maximumStreamBytes * 2,
+        windowsHide: true
+    });
+} catch (error) {
+    execution = { error: { code: error?.code || "RUNNER_ERROR" } };
+}
+
+const stdout = boundedText(execution?.stdout);
+const stderr = boundedText(execution?.stderr);
+const errorCode = execution?.error?.code || null;
+const outputTruncated = stdout.truncated || stderr.truncated || errorCode === "ENOBUFS";
+const status = errorCode === "ETIMEDOUT"
+    ? "timed-out"
+    : outputTruncated
+        ? "output-limited"
+        : errorCode
+            ? "runner-error"
+            : execution.status === 0
+                ? "passed"
+                : "failed";
+
+process.stdout.write(JSON.stringify({
+    schemaVersion: 1,
+    status,
+    exitCode: Number.isInteger(execution?.status) ? execution.status : null,
+    errorCode: errorCode === "ETIMEDOUT" || errorCode === "ENOBUFS"
+        ? errorCode
+        : errorCode ? "runner-error" : null,
+    signal: typeof execution?.signal === "string" ? execution.signal : null,
+    stdout: stdout.text,
+    stderr: stderr.text,
+    outputTruncated
+}));
 `;
 
 class SandboxStageTransferError extends Error {
@@ -159,6 +345,9 @@ function validateCapturedFiles(stagedWorkspace) {
     const expectedFiles = [...manifest.files].sort((left, right) =>
         left.name < right.name ? -1 : left.name > right.name ? 1 : 0
     );
+    if (hasRelativePathCollision(expectedFiles.map(file => file.name))) {
+        throw new SandboxStageTransferError("staged-file-path-collision");
+    }
     const actualFiles = [...capturedFiles].sort((left, right) =>
         left.name < right.name ? -1 : left.name > right.name ? 1 : 0
     );
@@ -166,10 +355,17 @@ function validateCapturedFiles(stagedWorkspace) {
     let totalBytes = 0;
     const files = actualFiles.map((file, index) => {
         const expected = expectedFiles[index];
+        let normalizedName;
+        try {
+            normalizedName = normalizeRelativePath(file?.name);
+        } catch {
+            throw new SandboxStageTransferError("staged-file-metadata-invalid");
+        }
         if (!file ||
             file.name !== expected.name ||
-            !/^[A-Za-z0-9][A-Za-z0-9._-]{0,89}\.js$/.test(file.name) ||
-            (file.name !== candidateTestFilename && /\.(?:test|spec)\.js$/i.test(file.name)) ||
+            normalizedName !== file.name ||
+            isCredentialRelativePath(file.name) ||
+            file.name.split("/").some(part => excludedDirectories.has(part.toLowerCase())) ||
             names.has(file.name.toLowerCase()) ||
             !Buffer.isBuffer(file.content) ||
             file.content.length !== file.size ||
@@ -178,7 +374,7 @@ function validateCapturedFiles(stagedWorkspace) {
             file.digest !== createHash("sha256").update(file.content).digest("hex") ||
             !Number.isSafeInteger(file.size) ||
             file.size < 0 ||
-            file.size > 256 * 1024) {
+            file.size > maxTransferFileBytes) {
             throw new SandboxStageTransferError("staged-file-metadata-invalid");
         }
         names.add(file.name.toLowerCase());
@@ -206,7 +402,7 @@ function createTransferPayload(staged) {
         }))
     };
     const payload = Buffer.from(JSON.stringify(metadata), "utf8");
-    if (payload.length > 3 * 1024 * 1024) {
+    if (payload.length > maxTransferPayloadBytes) {
         throw new SandboxStageTransferError("transfer-payload-size-limit-exceeded");
     }
     return {
@@ -271,6 +467,101 @@ function assertContainerPolicy(container, imageConfig, expectedState) {
     }
 }
 
+function parseTapTestSummary(output) {
+    const readCount = name => {
+        const match = output.match(new RegExp(`^# ${name} (\\d+)$`, "m"));
+        return match ? Number(match[1]) : null;
+    };
+    const summary = {
+        tests: readCount("tests"),
+        passed: readCount("pass"),
+        failed: readCount("fail"),
+        cancelled: readCount("cancelled"),
+        skipped: readCount("skipped"),
+        todo: readCount("todo")
+    };
+    return Object.values(summary).every(Number.isSafeInteger) ? summary : null;
+}
+
+function validateEvaluationOutput(output, stagedWorkspace, staged, { runId, durationMs }) {
+    let evaluation;
+    try {
+        evaluation = JSON.parse(output);
+    } catch (error) {
+        throw new SandboxStageTransferError("invalid-evaluator-output", error);
+    }
+    const validStatuses = new Set(["passed", "failed", "timed-out", "output-limited", "runner-error"]);
+    if (!evaluation ||
+        typeof evaluation !== "object" ||
+        evaluation.schemaVersion !== 1 ||
+        !validStatuses.has(evaluation.status) ||
+        (evaluation.exitCode !== null &&
+            (!Number.isInteger(evaluation.exitCode) || evaluation.exitCode < 0 || evaluation.exitCode > 255)) ||
+        ![null, "ETIMEDOUT", "ENOBUFS", "runner-error"].includes(evaluation.errorCode) ||
+        (evaluation.signal !== null &&
+            (typeof evaluation.signal !== "string" || evaluation.signal.length > 16)) ||
+        typeof evaluation.stdout !== "string" ||
+        Buffer.byteLength(evaluation.stdout, "utf8") > evaluationStreamLimitBytes ||
+        typeof evaluation.stderr !== "string" ||
+        Buffer.byteLength(evaluation.stderr, "utf8") > evaluationStreamLimitBytes ||
+        typeof evaluation.outputTruncated !== "boolean" ||
+        (evaluation.status === "passed" && evaluation.exitCode !== 0) ||
+        (evaluation.status === "failed" &&
+            (evaluation.exitCode === null || evaluation.exitCode === 0)) ||
+        (evaluation.status === "timed-out" && evaluation.errorCode !== "ETIMEDOUT") ||
+        (evaluation.status === "output-limited" && !evaluation.outputTruncated)) {
+        throw new SandboxStageTransferError("invalid-evaluator-output");
+    }
+
+    const manifest = stagedWorkspace.manifest;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId) ||
+        !Number.isFinite(durationMs) ||
+        durationMs < 0 ||
+        durationMs > dockerCallTimeoutMs * 2) {
+        throw new SandboxStageTransferError("evaluation-metadata-invalid");
+    }
+    return {
+        schemaVersion: 1,
+        runId,
+        status: evaluation.status,
+        command: "node --test --test-reporter=tap improvement-loop.candidate.test.js",
+        imageDigest,
+        sourceSnapshotHash: manifest.sourceSnapshotHash,
+        stagedSnapshotHash: staged.snapshotHash,
+        candidateDigest: manifest.candidateDigest,
+        transferredFileCount: staged.files.length,
+        transferredBytes: staged.totalBytes,
+        durationMs,
+        completedAt: new Date().toISOString(),
+        exitCode: evaluation.exitCode,
+        errorCode: evaluation.errorCode,
+        signal: evaluation.signal,
+        stdout: evaluation.stdout,
+        stderr: evaluation.stderr,
+        outputHash: createHash("sha256")
+            .update(JSON.stringify({ stdout: evaluation.stdout, stderr: evaluation.stderr }))
+            .digest("hex"),
+        testSummary: parseTapTestSummary(evaluation.stdout),
+        outputTruncated: evaluation.outputTruncated,
+        checks: {
+            localDockerContext: true,
+            pinnedImage: true,
+            noHostMounts: true,
+            networkDisabled: true,
+            readOnlyRootFilesystem: true,
+            nonRootNoCapabilities: true,
+            noNewPrivileges: true,
+            resourceLimits: true,
+            stagedHashesVerifiedInContainer: true,
+            fixedCandidateTestCommand: true
+        },
+        candidateCodeExecuted: true,
+        workspaceMounted: false,
+        validated: false,
+        applied: false
+    };
+}
+
 function createSandboxStageTransferProbe({
     platform = process.platform,
     env = process.env,
@@ -307,8 +598,18 @@ function createSandboxStageTransferProbe({
         return (result.stdout || "").trim();
     }
 
-    function run(stagedWorkspace) {
+    function runStage(stagedWorkspace, evaluateCandidate) {
         const staged = validateCapturedFiles(stagedWorkspace);
+        if (evaluateCandidate) {
+            const candidateFile = staged.files.find(file => file.name === candidateTestFilename);
+            if (!candidateFile ||
+                stagedWorkspace.manifest.candidateFile !== candidateTestFilename ||
+                stagedWorkspace.manifest.candidateDigest !== candidateFile.digest ||
+                !/^[a-f0-9]{64}$/.test(stagedWorkspace.manifest.sourceSnapshotHash || "")) {
+                throw new SandboxStageTransferError("staged-candidate-metadata-invalid");
+            }
+        }
+        const evaluationRunId = evaluateCandidate ? randomUUID() : null;
         const transfer = createTransferPayload(staged);
         const containerName = `offloading-stage-probe-${makeId()}`;
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,100}$/.test(containerName)) {
@@ -417,27 +718,45 @@ function createSandboxStageTransferProbe({
             if (JSON.stringify(actualOutput) !== JSON.stringify(transfer.expectedOutput)) {
                 throw new SandboxStageTransferError("transfer-verification-mismatch");
             }
-            result = {
-                status: "passed",
-                backend: "local-docker-desktop-linux",
-                imageDigest,
-                stagedSnapshotHash: staged.snapshotHash,
-                transferredFileCount: staged.files.length,
-                transferredBytes: staged.totalBytes,
-                checks: {
-                    localDockerContext: true,
-                    pinnedImage: true,
-                    noHostMounts: true,
-                    networkDisabled: true,
-                    readOnlyRootFilesystem: true,
-                    nonRootNoCapabilities: true,
-                    noNewPrivileges: true,
-                    resourceLimits: true,
-                    stagedHashesVerifiedInContainer: true
-                },
-                candidateCodeExecuted: false,
-                workspaceMounted: false
-            };
+            if (evaluateCandidate) {
+                const evaluationStartedAt = process.hrtime.bigint();
+                const evaluationOutput = docker([
+                    "container", "exec", "--interactive", "--user", "65534:65534",
+                    containerId, "node", "-e", candidateEvaluationScript
+                ]);
+                const durationMs = Number(process.hrtime.bigint() - evaluationStartedAt) / 1e6;
+                try {
+                    stagedWorkspace.verify();
+                } catch (error) {
+                    throw new SandboxStageTransferError("staged-workspace-changed-during-evaluation", error);
+                }
+                result = validateEvaluationOutput(evaluationOutput, stagedWorkspace, staged, {
+                    runId: evaluationRunId,
+                    durationMs
+                });
+            } else {
+                result = {
+                    status: "passed",
+                    backend: "local-docker-desktop-linux",
+                    imageDigest,
+                    stagedSnapshotHash: staged.snapshotHash,
+                    transferredFileCount: staged.files.length,
+                    transferredBytes: staged.totalBytes,
+                    checks: {
+                        localDockerContext: true,
+                        pinnedImage: true,
+                        noHostMounts: true,
+                        networkDisabled: true,
+                        readOnlyRootFilesystem: true,
+                        nonRootNoCapabilities: true,
+                        noNewPrivileges: true,
+                        resourceLimits: true,
+                        stagedHashesVerifiedInContainer: true
+                    },
+                    candidateCodeExecuted: false,
+                    workspaceMounted: false
+                };
+            }
         } catch (error) {
             failure = error instanceof SandboxStageTransferError
                 ? error
@@ -466,7 +785,14 @@ function createSandboxStageTransferProbe({
         return result;
     }
 
-    return { run };
+    return {
+        run(stagedWorkspace) {
+            return runStage(stagedWorkspace, false);
+        },
+        evaluate(stagedWorkspace) {
+            return runStage(stagedWorkspace, true);
+        }
+    };
 }
 
 module.exports = {

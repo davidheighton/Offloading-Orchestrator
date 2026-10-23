@@ -12,9 +12,11 @@ const {
 } = require("./sandbox-workspace");
 const {
     candidateTestFilename,
-    parseCandidateTestDiff
+    parseCandidateTestDiff,
+    parseProposalDiff
 } = require("./candidate-diff");
 const {
+    captureWorkspaceSnapshot,
     computeWorkspaceSnapshot,
     snapshotAlgorithmVersion
 } = require("./workspace-snapshot");
@@ -23,7 +25,7 @@ function fixture(t) {
     const workspacePath = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-source-"));
     const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-state-"));
     fs.writeFileSync(path.join(workspacePath, "app.js"), "module.exports = 1;\n");
-    fs.writeFileSync(path.join(workspacePath, "app.test.js"), "const fixtureSecret = 'test-only';\n");
+    fs.writeFileSync(path.join(workspacePath, "app.test.js"), "assert.ok(true);\n");
     fs.writeFileSync(path.join(workspacePath, "README.md"), "Documentation stays out of stage.\n");
     fs.writeFileSync(path.join(workspacePath, "package.json"), JSON.stringify({
         type: "commonjs",
@@ -62,6 +64,7 @@ function makeProposal(baseSnapshot, lines = [
     const proposalText = makeDiff(lines);
     const parsed = parseCandidateTestDiff(proposalText);
     assert.equal(parsed.eligible, true);
+    const genericParsed = parseProposalDiff(proposalText);
     return {
         schemaVersion: 1,
         status: "completed",
@@ -71,11 +74,44 @@ function makeProposal(baseSnapshot, lines = [
             status: "eligible-for-sandbox-review",
             reasonCode: null,
             target: candidateTestFilename,
+            files: genericParsed.files.map(file => ({
+                path: file.path,
+                operation: file.operation,
+                baseDigest: null
+            })),
             addedLineCount: lines.length,
             baseSnapshotHash: baseSnapshot.hash,
             currentSnapshotHash: baseSnapshot.hash
         },
         baseSnapshotHash: baseSnapshot.hash,
+        validated: false,
+        applied: false
+    };
+}
+
+function makeProposalFromDiff(paths, proposalText) {
+    const captured = captureWorkspaceSnapshot(paths.workspacePath, paths.stateDirectory);
+    const parsed = parseProposalDiff(proposalText);
+    assert.equal(parsed.eligible, true);
+    return {
+        schemaVersion: 1,
+        status: "completed",
+        proposalText,
+        staticPreflight: {
+            schemaVersion: 1,
+            status: "eligible-for-sandbox-review",
+            reasonCode: null,
+            target: parsed.files.length === 1 ? parsed.files[0].path : null,
+            files: parsed.files.map(file => ({
+                path: file.path,
+                operation: file.operation,
+                baseDigest: captured.files.find(baseFile => baseFile.name === file.path)?.digest ?? null
+            })),
+            addedLineCount: parsed.addedLineCount,
+            baseSnapshotHash: captured.snapshot.hash,
+            currentSnapshotHash: captured.snapshot.hash
+        },
+        baseSnapshotHash: captured.snapshot.hash,
         validated: false,
         applied: false
     };
@@ -97,14 +133,76 @@ function createStage(t, values = {}) {
     return { ...paths, baseSnapshot, proposal, staged };
 }
 
-test("the stager copies only bounded production sources and verifies both snapshots", t => {
+test("nested multi-file proposals are applied only to a full staged copy", t => {
+    const paths = fixture(t);
+    fs.mkdirSync(path.join(paths.workspacePath, "src", "core"), { recursive: true });
+    fs.writeFileSync(path.join(paths.workspacePath, "src", "core", "module.mjs"), "export const value = 1;\n");
+    fs.mkdirSync(path.join(paths.workspacePath, "docs"));
+    fs.writeFileSync(path.join(paths.workspacePath, "docs", "old.md"), "old documentation\n");
+    const proposalText = [
+        "diff --git a/src/core/module.mjs b/src/core/module.mjs",
+        "index 1234567..abcdef0 100644",
+        "--- a/src/core/module.mjs",
+        "+++ b/src/core/module.mjs",
+        "@@ -1 +1 @@",
+        "-export const value = 1;",
+        "+export const value = 2;",
+        "diff --git a/tests/nested/new.spec.js b/tests/nested/new.spec.js",
+        "new file mode 100644",
+        "--- /dev/null",
+        "+++ b/tests/nested/new.spec.js",
+        "@@ -0,0 +1 @@",
+        "+assert.ok(true);",
+        "diff --git a/docs/old.md b/docs/old.md",
+        "deleted file mode 100644",
+        "--- a/docs/old.md",
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        "-old documentation"
+    ].join("\n");
+    const proposal = makeProposalFromDiff(paths, proposalText);
+    const baseSnapshot = computeWorkspaceSnapshot(paths.workspacePath, paths.stateDirectory);
+    const staged = createSandboxWorkspace({ ...paths, baseSnapshot, proposal });
+    t.after(() => {
+        if (fs.existsSync(staged.stageDirectory)) staged.cleanup();
+    });
+
+    assert.equal(
+        fs.readFileSync(path.join(staged.stageDirectory, "src", "core", "module.mjs"), "utf8"),
+        "export const value = 2;\n"
+    );
+    assert.equal(
+        fs.readFileSync(path.join(staged.stageDirectory, "tests", "nested", "new.spec.js"), "utf8"),
+        "assert.ok(true);\n"
+    );
+    assert.equal(fs.existsSync(path.join(staged.stageDirectory, "docs", "old.md")), false);
+    assert.equal(
+        fs.readFileSync(path.join(paths.workspacePath, "src", "core", "module.mjs"), "utf8"),
+        "export const value = 1;\n"
+    );
+    assert.equal(fs.existsSync(path.join(paths.workspacePath, "docs", "old.md")), true);
+    assert.deepEqual(staged.manifest.proposalFiles.map(file => file.operation), [
+        "modify",
+        "add",
+        "delete"
+    ]);
+    assert.ok(staged.manifest.proposalFiles[0].baseDigest);
+    assert.equal(staged.manifest.validated, false);
+    assert.equal(staged.manifest.applied, false);
+    assert.equal(staged.verify().status, "verified");
+});
+
+test("the stager captures the recursive project tree and applies additions only in the stage", t => {
     const { workspacePath, stateDirectory, staged } = createStage(t);
     const stagedNames = fs.readdirSync(staged.stageDirectory).sort();
 
     assert.equal(staged.status, "staged-unexecuted");
     assert.deepEqual(stagedNames, [
+        "README.md",
         "app.js",
-        candidateTestFilename
+        "app.test.js",
+        candidateTestFilename,
+        "package.json"
     ]);
     assert.equal(path.dirname(staged.stageDirectory), path.join(stateDirectory, "sandbox-staging"));
     assert.equal(path.dirname(staged.manifestPath), path.dirname(staged.stageDirectory));
@@ -115,9 +213,10 @@ test("the stager copies only bounded production sources and verifies both snapsh
     assert.equal(staged.manifest.applied, false);
     assert.equal(staged.manifest.staged, true);
     assert.ok(staged.manifest.files.every(file => ["snapshot", "proposal"].includes(file.origin)));
-    assert.equal(staged.manifest.files.some(file => file.name === "app.test.js"), false);
-    assert.equal(staged.manifest.files.some(file => file.name === "README.md"), false);
-    assert.equal(staged.manifest.files.some(file => /package\.json|node_modules|\.git|copilot-knowledge|\.env/.test(file.name)), false);
+    assert.equal(staged.manifest.files.some(file => file.name === "app.test.js"), true);
+    assert.equal(staged.manifest.files.some(file => file.name === "README.md"), true);
+    assert.equal(staged.manifest.files.some(file => file.name === "package.json"), true);
+    assert.equal(staged.manifest.files.some(file => /node_modules|\.git|copilot-knowledge|\.env/.test(file.name)), false);
     assert.equal(fs.readFileSync(path.join(staged.stageDirectory, candidateTestFilename), "utf8").endsWith("\n"), true);
     assert.equal(staged.cleanup(), true);
     assert.equal(fs.existsSync(staged.stageDirectory), false);
@@ -162,7 +261,7 @@ test("verified stage capture returns detached bytes and rechecks the source", t 
     );
 });
 
-test("the candidate name must not already exist in any case in the source snapshot", t => {
+test("addition targets must not already exist in any case in the source snapshot", t => {
     const paths = fixture(t);
     fs.writeFileSync(
         path.join(paths.workspacePath, "Improvement-Loop.Candidate.Test.js"),
@@ -173,7 +272,7 @@ test("the candidate name must not already exist in any case in the source snapsh
 
     assert.throws(
         () => createSandboxWorkspace({ ...paths, baseSnapshot, proposal }),
-        error => error instanceof SandboxWorkspaceError && error.code === "candidate-already-present-in-snapshot"
+        error => error instanceof SandboxWorkspaceError && error.code === "proposal-target-already-exists"
     );
 });
 
@@ -292,7 +391,7 @@ test("staging refuses a state directory nested inside the workspace", t => {
             baseSnapshot,
             proposal
         }),
-        error => error instanceof SandboxWorkspaceError && error.code === "staging-root-overlaps-workspace"
+        error => error instanceof SandboxWorkspaceError && error.code === "workspace-snapshot-failed"
     );
 });
 

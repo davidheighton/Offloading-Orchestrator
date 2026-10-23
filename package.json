@@ -9,6 +9,7 @@
     "improve:loop": "node improvement-loop.js",
     "improve:loop:sandbox-probe": "node sandbox-canary.js",
     "improve:loop:sandbox-stage-probe": "node sandbox-stage-probe.js",
+    "improve:loop:sandbox-evaluation-probe": "node sandbox-stage-evaluation-probe.js",
     "code": "node coding-job.js",
     "models": "node ollama-model-cli.js",
     "test": "node --test"
