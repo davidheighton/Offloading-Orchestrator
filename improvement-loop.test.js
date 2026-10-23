@@ -63,6 +63,30 @@ function jsonResponse(status, data) {
     };
 }
 
+function makeTransferResult() {
+    return {
+        status: "passed",
+        backend: "local-docker-desktop-linux",
+        imageDigest: `sha256:${"1".repeat(64)}`,
+        stagedSnapshotHash: "2".repeat(64),
+        transferredFileCount: 2,
+        transferredBytes: 256,
+        checks: {
+            localDockerContext: true,
+            pinnedImage: true,
+            noHostMounts: true,
+            networkDisabled: true,
+            readOnlyRootFilesystem: true,
+            nonRootNoCapabilities: true,
+            noNewPrivileges: true,
+            resourceLimits: true,
+            stagedHashesVerifiedInContainer: true
+        },
+        candidateCodeExecuted: false,
+        workspaceMounted: false
+    };
+}
+
 function createFixture(options = {}) {
     const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "improvement-loop-"));
     const workspaceDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "improvement-loop-workspace-"));
@@ -119,8 +143,8 @@ const repositorySummary = {
     limitations: ["No patch application or scheduling."]
 };
 
-async function prepareSubmission(fixture) {
-    fixture.loop.start(validConfiguration);
+async function prepareSubmission(fixture, configuration = validConfiguration) {
+    fixture.loop.start(configuration);
     fixture.respond(jsonResponse(200, { summary: repositorySummary }));
     const result = await fixture.loop.tick();
     assert.equal(result.phase, "ready-to-submit");
@@ -128,14 +152,14 @@ async function prepareSubmission(fixture) {
     return result;
 }
 
-async function submitWorkflow(fixture, status = 202) {
-    await prepareSubmission(fixture);
+async function submitWorkflow(fixture, status = 202, configuration = validConfiguration) {
+    await prepareSubmission(fixture, configuration);
     fixture.respond(jsonResponse(status, { id: workflowId, status: "queued" }));
     return fixture.loop.tick();
 }
 
-async function completeAdvice(fixture) {
-    await submitWorkflow(fixture);
+async function completeAdvice(fixture, configuration = validConfiguration) {
+    await submitWorkflow(fixture, 202, configuration);
     fixture.setTime("2025-01-01T00:00:15.000Z");
     fixture.respond(jsonResponse(200, {
         id: workflowId,
@@ -146,8 +170,8 @@ async function completeAdvice(fixture) {
     return fixture.loop.tick();
 }
 
-async function completeProposal(fixture, codingResult) {
-    await completeAdvice(fixture);
+async function completeProposal(fixture, codingResult, configuration = validConfiguration) {
+    await completeAdvice(fixture, configuration);
     fixture.respond(jsonResponse(202, { id: proposalWorkflowId, status: "queued" }));
     await fixture.loop.tick();
     fixture.setTime("2025-01-01T00:00:30.000Z");
@@ -178,8 +202,28 @@ test("start records bounded cloud-only provider advice authorization", t => {
     assert.equal(state.budgetStatus, "provider calls reserved; searches unused");
     assert.equal(state.authorizationHash.length, 64);
     assert.deepEqual(state.authorization.providers, ["claude", "gemini"]);
+    assert.equal(state.authorization.sandboxTransferAuthorizedAt, undefined);
     assert.deepEqual(state.usage, { cycles: 0, providerCalls: 0, searches: 0, patches: 0 });
     assert.equal(state.tickCount, 0);
+});
+
+test("sandbox-transfer authorization is explicit, timestamped, and included in the authorization hash", t => {
+    const fixture = createFixture();
+    t.after(fixture.cleanup);
+
+    const state = fixture.loop.start({
+        ...validConfiguration,
+        confirmedSandboxTransfer: true
+    });
+
+    assert.equal(
+        state.authorization.sandboxTransferAuthorizedAt,
+        state.authorization.createdAt
+    );
+    assert.equal(
+        state.authorizationHash,
+        createHash("sha256").update(JSON.stringify(state.authorization)).digest("hex")
+    );
 });
 
 test("workspace changes during context collection prevent provider submission", async t => {
@@ -216,7 +260,8 @@ test("start rejects unconfirmed, local, unknown, duplicate, and out-of-range aut
         { ...validConfiguration, maxProviderCalls: 51 },
         { ...validConfiguration, maxSearches: 21 },
         { ...validConfiguration, windowMinutes: 4 },
-        { ...validConfiguration, windowMinutes: 721 }
+        { ...validConfiguration, windowMinutes: 721 },
+        { ...validConfiguration, confirmedSandboxTransfer: "yes" }
     ];
 
     for (const configuration of invalidConfigurations) {
@@ -355,6 +400,7 @@ test("advice advances to a bounded code proposal, which is stored but never appl
     assert.equal(proposalArtifact.schemaVersion, 1);
     assert.equal(proposalArtifact.validated, false);
     assert.equal(proposalArtifact.applied, false);
+    assert.equal(proposalArtifact.sandboxTransfer, undefined);
 });
 
 test("sandbox-probe requires confirmation and transfers only the latest verified proposal", async t => {
@@ -379,16 +425,7 @@ test("sandbox-probe requires confirmation and transfers only the latest verified
             return {
                 run(stage) {
                     assert.equal(stage, stagedWorkspace);
-                    return {
-                        status: "passed",
-                        candidateCodeExecuted: false,
-                        workspaceMounted: false,
-                        checks: {
-                            stagedHashesVerifiedInContainer: true,
-                            networkDisabled: true,
-                            noHostMounts: true
-                        }
-                    };
+                    return makeTransferResult();
                 }
             };
         }
@@ -485,6 +522,152 @@ test("sandbox-probe requires a complete non-execution attestation and still clea
         /required non-execution attestation/
     );
     assert.equal(cleanupCalled, true);
+});
+
+test("an opted-in run automatically persists the transfer attestation without validating the proposal", async t => {
+    let cleanupCalled = false;
+    let transferCalls = 0;
+    const stagedWorkspace = { cleanup() { cleanupCalled = true; } };
+    const fixture = createFixture({
+        sandboxWorkspaceFactory({ proposal }) {
+            assert.equal(proposal.validated, false);
+            return stagedWorkspace;
+        },
+        sandboxTransferProbeFactory() {
+            return {
+                run(stage) {
+                    assert.equal(stage, stagedWorkspace);
+                    transferCalls += 1;
+                    return makeTransferResult();
+                }
+            };
+        }
+    });
+    t.after(fixture.cleanup);
+    const completed = await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"])),
+        { ...validConfiguration, confirmedSandboxTransfer: true }
+    );
+    const state = fixture.loop.status();
+    const proposalArtifact = JSON.parse(fs.readFileSync(
+        path.join(fixture.stateDirectory, "latest-proposal.json"),
+        "utf8"
+    ));
+
+    assert.equal(completed.phase, "context");
+    assert.match(completed.message, /staged-byte transfer only/);
+    assert.equal(transferCalls, 1);
+    assert.equal(cleanupCalled, true);
+    assert.equal(state.authorization.sandboxTransferAuthorizedAt, state.authorization.createdAt);
+    assert.equal(state.sandboxTransfer.status, "passed");
+    assert.equal(state.sandboxTransfer.transferredFileCount, 2);
+    assert.equal(state.sandboxTransfer.candidateCodeExecuted, false);
+    assert.equal(state.sandboxTransfer.proposalArtifactHash, state.proposalArtifactHash);
+    assert.equal(proposalArtifact.sandboxTransfer, undefined);
+    assert.equal(proposalArtifact.validated, false);
+    assert.equal(proposalArtifact.applied, false);
+    assert.equal(state.proposalArtifactHash, createHash("sha256")
+        .update(JSON.stringify(proposalArtifact))
+        .digest("hex"));
+    assert.equal(fixture.calls.length, 5);
+
+    const statePath = path.join(fixture.stateDirectory, "run-state.json");
+    const interruptedState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    interruptedState.phase = "sandboxing";
+    interruptedState.cycleStage = "proposal";
+    interruptedState.workflowId = null;
+    interruptedState.pendingProviderCalls = 0;
+    interruptedState.pollDeadlineAt = null;
+    interruptedState.nextPollAt = null;
+    interruptedState.pollCount = 0;
+    interruptedState.sandboxTransfer = null;
+    resealState(interruptedState);
+    fs.writeFileSync(statePath, JSON.stringify(interruptedState));
+
+    const restarted = fixture.restart();
+    const interrupted = await restarted.tick();
+    assert.equal(interrupted.status, "halted");
+    assert.equal(interrupted.stopReason, "sandbox-transfer-interrupted");
+    assert.equal(interrupted.lastErrorCode, "sandbox-transfer-interrupted");
+    assert.equal(transferCalls, 1);
+    assert.equal(fixture.calls.length, 5);
+});
+
+test("restart completes a persisted successful transfer without repeating it", async t => {
+    let transferCalls = 0;
+    const fixture = createFixture({
+        sandboxWorkspaceFactory() {
+            return { cleanup() {} };
+        },
+        sandboxTransferProbeFactory() {
+            return {
+                run() {
+                    transferCalls += 1;
+                    return makeTransferResult();
+                }
+            };
+        }
+    });
+    t.after(fixture.cleanup);
+    await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"])),
+        { ...validConfiguration, confirmedSandboxTransfer: true }
+    );
+
+    const statePath = path.join(fixture.stateDirectory, "run-state.json");
+    const interruptedState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    interruptedState.phase = "sandboxing";
+    interruptedState.cycleStage = "proposal";
+    interruptedState.usage.cycles = 0;
+    interruptedState.lastCycleOutcome = null;
+    resealState(interruptedState);
+    fs.writeFileSync(statePath, JSON.stringify(interruptedState));
+
+    const recovered = await fixture.restart().tick();
+    assert.equal(recovered.phase, "context");
+    assert.equal(recovered.usage.cycles, 1);
+    assert.match(recovered.message, /without repeating the transfer/);
+    assert.equal(transferCalls, 1);
+    assert.equal(fixture.calls.length, 5);
+});
+
+test("automatic sandbox-transfer failures halt the run and clean up the stage", async t => {
+    let cleanupCalled = false;
+    const fixture = createFixture({
+        sandboxWorkspaceFactory() {
+            return { cleanup() { cleanupCalled = true; } };
+        },
+        sandboxTransferProbeFactory() {
+            return {
+                run() {
+                    const error = new Error("container policy mismatch");
+                    error.code = "container-policy-mismatch";
+                    throw error;
+                }
+            };
+        }
+    });
+    t.after(fixture.cleanup);
+    const completed = await completeProposal(
+        fixture,
+        makeProposalResponse(makeCandidateDiff(["test('retries once', () => {});"])),
+        { ...validConfiguration, confirmedSandboxTransfer: true }
+    );
+    const artifact = JSON.parse(fs.readFileSync(
+        path.join(fixture.stateDirectory, "latest-proposal.json"),
+        "utf8"
+    ));
+
+    assert.equal(completed.status, "halted");
+    assert.equal(completed.stopReason, "sandbox-transfer-failed");
+    assert.equal(completed.lastErrorCode, "container-policy-mismatch");
+    assert.equal(completed.usage.cycles, 0);
+    assert.equal(cleanupCalled, true);
+    assert.equal(artifact.sandboxTransfer, undefined);
+    assert.equal(artifact.validated, false);
+    assert.equal(artifact.applied, false);
 });
 
 test("proposal preflight rejects a workspace changed after context collection", async t => {
@@ -1065,6 +1248,16 @@ test("CLI requires explicit cloud-provider sharing authorization and parses unkn
         confirmedProviderSharing: true,
         acknowledgeUnknownProviderWork: true
     });
+    assert.equal(parseArguments([
+        "start",
+        "--providers", "claude",
+        "--max-cycles", "1",
+        "--max-provider-calls", "4",
+        "--max-searches", "0",
+        "--window-minutes", "30",
+        "--confirm-provider-sharing",
+        "--confirm-sandbox-transfer"
+    ]).configuration.confirmedSandboxTransfer, true);
 });
 
 test("controller has no shell, browser, or provider-client imports", () => {

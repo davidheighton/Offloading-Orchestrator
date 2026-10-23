@@ -238,6 +238,10 @@ function validateStartOptions(options, now) {
         typeof options.acknowledgeUnknownProviderWork !== "boolean") {
         throw new Error("acknowledgeUnknownProviderWork must be a boolean.");
     }
+    if (options.confirmedSandboxTransfer !== undefined &&
+        typeof options.confirmedSandboxTransfer !== "boolean") {
+        throw new Error("confirmedSandboxTransfer must be a boolean.");
+    }
     if (!Array.isArray(options.providers) || options.providers.length === 0 ||
         options.providers.length > cloudProviders.size ||
         options.providers.some(provider => !cloudProviders.has(provider)) ||
@@ -261,7 +265,7 @@ function validateStartOptions(options, now) {
     if (!integerInRange(options.windowMinutes, 5, maxWindowMinutes)) {
         throw new Error(`windowMinutes must be an integer from 5 to ${maxWindowMinutes}.`);
     }
-    return {
+    const authorization = {
         providers: [...options.providers].sort(),
         maxCycles: options.maxCycles,
         maxProviderCalls: options.maxProviderCalls,
@@ -270,6 +274,10 @@ function validateStartOptions(options, now) {
         expiresAt: new Date(now.getTime() + options.windowMinutes * 60 * 1000).toISOString(),
         providerSharingAuthorizedAt: now.toISOString()
     };
+    if (options.confirmedSandboxTransfer === true) {
+        authorization.sandboxTransferAuthorizedAt = now.toISOString();
+    }
+    return authorization;
 }
 
 function hashAuthorization(authorization) {
@@ -549,6 +557,88 @@ function makeProposalArtifact(workflow, workspacePath, stateDirectory, workspace
     };
 }
 
+function makeSandboxTransferAttestation(result, completedAt) {
+    const checkNames = [
+        "localDockerContext",
+        "pinnedImage",
+        "noHostMounts",
+        "networkDisabled",
+        "readOnlyRootFilesystem",
+        "nonRootNoCapabilities",
+        "noNewPrivileges",
+        "resourceLimits",
+        "stagedHashesVerifiedInContainer"
+    ];
+    if (result?.status !== "passed" ||
+        result.backend !== "local-docker-desktop-linux" ||
+        !/^sha256:[a-f0-9]{64}$/.test(result.imageDigest || "") ||
+        !/^[a-f0-9]{64}$/.test(result.stagedSnapshotHash || "") ||
+        !Number.isInteger(result.transferredFileCount) ||
+        result.transferredFileCount < 1 ||
+        result.transferredFileCount > snapshotLimits.maxFiles ||
+        !Number.isInteger(result.transferredBytes) ||
+        result.transferredBytes < 0 ||
+        result.transferredBytes > snapshotLimits.maxTotalBytes ||
+        result.candidateCodeExecuted !== false ||
+        result.workspaceMounted !== false ||
+        !result.checks ||
+        checkNames.some(name => result.checks[name] !== true)) {
+        throw new Error("Sandbox transfer did not return the required non-execution attestation.");
+    }
+    return {
+        schemaVersion: 1,
+        status: "passed",
+        completedAt: completedAt.toISOString(),
+        backend: result.backend,
+        imageDigest: result.imageDigest,
+        stagedSnapshotHash: result.stagedSnapshotHash,
+        transferredFileCount: result.transferredFileCount,
+        transferredBytes: result.transferredBytes,
+        checks: Object.fromEntries(checkNames.map(name => [name, true])),
+        candidateCodeExecuted: false,
+        workspaceMounted: false
+    };
+}
+
+function isValidPersistedSandboxTransfer(transfer, state) {
+    const checkNames = [
+        "localDockerContext",
+        "pinnedImage",
+        "noHostMounts",
+        "networkDisabled",
+        "readOnlyRootFilesystem",
+        "nonRootNoCapabilities",
+        "noNewPrivileges",
+        "resourceLimits",
+        "stagedHashesVerifiedInContainer"
+    ];
+    return transfer &&
+        typeof transfer === "object" &&
+        !Array.isArray(transfer) &&
+        transfer.schemaVersion === 1 &&
+        transfer.status === "passed" &&
+        typeof transfer.completedAt === "string" &&
+        Number.isFinite(Date.parse(transfer.completedAt)) &&
+        transfer.backend === "local-docker-desktop-linux" &&
+        /^sha256:[a-f0-9]{64}$/.test(transfer.imageDigest || "") &&
+        /^[a-f0-9]{64}$/.test(transfer.stagedSnapshotHash || "") &&
+        Number.isInteger(transfer.transferredFileCount) &&
+        transfer.transferredFileCount > 0 &&
+        transfer.transferredFileCount <= snapshotLimits.maxFiles &&
+        Number.isInteger(transfer.transferredBytes) &&
+        transfer.transferredBytes >= 0 &&
+        transfer.transferredBytes <= snapshotLimits.maxTotalBytes &&
+        transfer.candidateCodeExecuted === false &&
+        transfer.workspaceMounted === false &&
+        transfer.proposalArtifactHash === state.proposalArtifactHash &&
+        typeof transfer.proposalWorkflowId === "string" &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(transfer.proposalWorkflowId) &&
+        state.authorization.sandboxTransferAuthorizedAt !== undefined &&
+        transfer.checks &&
+        typeof transfer.checks === "object" &&
+        checkNames.every(name => transfer.checks[name] === true);
+}
+
 function summarizeWorkflowBranches(threads) {
     return threads.slice(0, cloudProviders.size).map(thread => ({
         provider: cloudProviders.has(thread?.job?.provider) ? thread.job.provider : null,
@@ -601,7 +691,7 @@ function validateState(state) {
         !["configured", "stopped", "expired", "halted", "completed"].includes(state.status) ||
         state.cycleExecution !== cycleExecution ||
         state.budgetStatus !== budgetStatus ||
-        !["context", "ready-to-submit", "submitting", "polling", "terminal"].includes(state.phase) ||
+        !["context", "ready-to-submit", "submitting", "polling", "sandboxing", "terminal"].includes(state.phase) ||
         !["advice", "proposal"].includes(state.cycleStage) ||
         (state.workflowId !== null && (typeof state.workflowId !== "string" ||
             !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(state.workflowId))) ||
@@ -655,6 +745,13 @@ function validateState(state) {
             (state.pendingProviderCalls !== reservedCallsForStage(state) || state.workflowId !== null)) ||
         (state.phase === "polling" &&
             (!state.workflowId || state.pendingProviderCalls !== reservedCallsForStage(state) || !state.pollDeadlineAt)) ||
+        (state.phase === "sandboxing" &&
+            (state.status !== "configured" ||
+                state.cycleStage !== "proposal" ||
+                state.workflowId !== null ||
+                state.pendingProviderCalls !== 0 ||
+                state.proposalArtifactHash === null ||
+                state.authorization.sandboxTransferAuthorizedAt === undefined)) ||
         (state.cycleStage === "proposal" && state.adviceArtifactHash === null) ||
         (state.phase === "context" && state.cycleStage !== "advice") ||
         (state.status === "configured" && state.phase === "terminal") ||
@@ -664,14 +761,25 @@ function validateState(state) {
         state.usage.patches !== 0) {
         throw new StateFileError("Run state counters or phase are inconsistent; it was not changed.");
     }
+    if (state.sandboxTransfer !== undefined && state.sandboxTransfer !== null &&
+        !isValidPersistedSandboxTransfer(state.sandboxTransfer, state)) {
+        throw new StateFileError("Persisted sandbox-transfer attestation is invalid; it was not changed.");
+    }
     if (!Number.isFinite(Date.parse(state.authorization.expiresAt)) ||
         !Number.isFinite(Date.parse(state.authorization.createdAt)) ||
         !Number.isFinite(Date.parse(state.authorization.providerSharingAuthorizedAt))) {
         throw new StateFileError("Run authorization timestamps are invalid; it was not changed.");
     }
+    if (state.authorization.sandboxTransferAuthorizedAt !== undefined &&
+        (typeof state.authorization.sandboxTransferAuthorizedAt !== "string" ||
+            !Number.isFinite(Date.parse(state.authorization.sandboxTransferAuthorizedAt)) ||
+            state.authorization.sandboxTransferAuthorizedAt !== state.authorization.createdAt)) {
+        throw new StateFileError("Sandbox-transfer authorization is invalid; it was not changed.");
+    }
     try {
         validateStartOptions({
             confirmedProviderSharing: true,
+            confirmedSandboxTransfer: state.authorization.sandboxTransferAuthorizedAt !== undefined,
             providers: state.authorization.providers,
             maxCycles: state.authorization.maxCycles,
             maxProviderCalls: state.authorization.maxProviderCalls,
@@ -774,6 +882,26 @@ function createImprovementLoop(options = {}) {
         state.stopReason = reason;
         state.updatedAt = now.toISOString();
         writeState(paths().state, state);
+        return state;
+    }
+
+    function completeProposalCycle(state, outcome, now) {
+        state.lastCycleOutcome = outcome;
+        state.usage.cycles += 1;
+        state.cycleStage = "advice";
+        if (now.getTime() >= Date.parse(state.authorization.expiresAt)) {
+            setTerminalState(state, "expired", "authorization-window-ended", now);
+        } else if (state.usage.cycles >= state.authorization.maxCycles) {
+            setTerminalState(state, "completed", "cycle-budget-exhausted", now);
+        } else if (state.usage.providerCalls + state.authorization.providers.length + 3 >
+            state.authorization.maxProviderCalls) {
+            setTerminalState(state, "completed", "provider-budget-exhausted", now);
+        } else {
+            state.workspaceBase = null;
+            state.phase = "context";
+            state.updatedAt = now.toISOString();
+            writeState(paths().state, state);
+        }
         return state;
     }
 
@@ -898,6 +1026,7 @@ function createImprovementLoop(options = {}) {
                 adviceArtifactBytes: 0,
                 proposalArtifactHash: null,
                 proposalArtifactBytes: 0,
+                sandboxTransfer: null,
                 lastCycleOutcome: null,
                 lastErrorCode: null,
                 lastHttpStatus: null,
@@ -925,6 +1054,49 @@ function createImprovementLoop(options = {}) {
                 stopRequested: true
             } : {})
         };
+    }
+
+    function executeSandboxTransfer(proposal) {
+        let baseSnapshot;
+        try {
+            baseSnapshot = computeWorkspaceSnapshot(workspacePath, stateDirectory);
+        } catch (error) {
+            throw new Error(`The workspace snapshot is unavailable; sandbox transfer was not started (${error.code || "snapshot-error"}).`, {
+                cause: error
+            });
+        }
+        if (proposal.baseSnapshotHash !== baseSnapshot.hash ||
+            proposal.staticPreflight?.baseSnapshotHash !== baseSnapshot.hash ||
+            proposal.staticPreflight?.currentSnapshotHash !== baseSnapshot.hash) {
+            throw new Error("The proposal no longer matches the live workspace snapshot; sandbox transfer was not started.");
+        }
+
+        let stagedWorkspace = null;
+        let attestation = null;
+        let failure = null;
+        try {
+            stagedWorkspace = sandboxWorkspaceFactory({
+                workspacePath,
+                stateDirectory,
+                baseSnapshot,
+                proposal
+            });
+            const transferResult = sandboxTransferProbeFactory().run(stagedWorkspace);
+            attestation = makeSandboxTransferAttestation(transferResult, currentTime());
+        } catch (error) {
+            failure = error;
+        } finally {
+            if (stagedWorkspace) {
+                try {
+                    stagedWorkspace.cleanup();
+                } catch (error) {
+                    if (failure) failure.cleanupError = error.code || "staging-cleanup-failed";
+                    else failure = new Error("Sandbox transfer passed but staged cleanup failed.", { cause: error });
+                }
+            }
+        }
+        if (failure) throw failure;
+        return attestation;
     }
 
     function sandboxProbe(confirmed) {
@@ -959,52 +1131,7 @@ function createImprovementLoop(options = {}) {
                 throw new Error("The latest proposal is not eligible for sandbox staging.");
             }
 
-            let baseSnapshot;
-            try {
-                baseSnapshot = computeWorkspaceSnapshot(workspacePath, stateDirectory);
-            } catch (error) {
-                throw new Error(`The workspace snapshot is unavailable; sandbox transfer was not started (${error.code || "snapshot-error"}).`, {
-                    cause: error
-                });
-            }
-            if (proposal.baseSnapshotHash !== baseSnapshot.hash ||
-                proposal.staticPreflight.baseSnapshotHash !== baseSnapshot.hash ||
-                proposal.staticPreflight.currentSnapshotHash !== baseSnapshot.hash) {
-                throw new Error("The latest proposal no longer matches the live workspace snapshot; sandbox transfer was not started.");
-            }
-
-            let stagedWorkspace = null;
-            let transferResult = null;
-            let failure = null;
-            try {
-                stagedWorkspace = sandboxWorkspaceFactory({
-                    workspacePath,
-                    stateDirectory,
-                    baseSnapshot,
-                    proposal
-                });
-                transferResult = sandboxTransferProbeFactory().run(stagedWorkspace);
-                if (transferResult?.status !== "passed" ||
-                    transferResult.candidateCodeExecuted !== false ||
-                    transferResult.workspaceMounted !== false ||
-                    transferResult.checks?.stagedHashesVerifiedInContainer !== true ||
-                    transferResult.checks?.networkDisabled !== true ||
-                    transferResult.checks?.noHostMounts !== true) {
-                    throw new Error("Sandbox transfer did not return the required non-execution attestation.");
-                }
-            } catch (error) {
-                failure = error;
-            } finally {
-                if (stagedWorkspace) {
-                    try {
-                        stagedWorkspace.cleanup();
-                    } catch (error) {
-                        if (failure) failure.cleanupError = error.code || "staging-cleanup-failed";
-                        else failure = new Error("Sandbox transfer passed but staged cleanup failed.", { cause: error });
-                    }
-                }
-            }
-            if (failure) throw failure;
+            const transferResult = executeSandboxTransfer(proposal);
             return {
                 ...transferResult,
                 proposalWorkflowId: proposal.workflowId,
@@ -1076,6 +1203,52 @@ function createImprovementLoop(options = {}) {
             if (state.phase === "submitting") {
                 setTerminalState(state, "halted", "ambiguous-submission-after-restart", now);
                 return { ...includeProviderWorkStatus(state), message: "A prior submission has an unknown outcome; no retry was made." };
+            }
+
+            if (state.phase === "sandboxing") {
+                if (state.sandboxTransfer &&
+                    state.sandboxTransfer.proposalArtifactHash === state.proposalArtifactHash) {
+                    let proposal;
+                    try {
+                        proposal = readVerifiedArtifact(
+                            pathsValue.proposalArtifact,
+                            maxResultArtifactBytes,
+                            state.proposalArtifactHash
+                        );
+                    } catch (error) {
+                        if (!(error instanceof StateFileError)) throw error;
+                        state.lastErrorCode = "sandbox-transfer-recovery-invalid";
+                        setTerminalState(state, "halted", "sandbox-transfer-recovery-invalid", now);
+                        return {
+                            ...state,
+                            message: "The persisted transfer result could not be matched to its proposal; the run was halted."
+                        };
+                    }
+                    if (proposal.workflowId !== state.sandboxTransfer.proposalWorkflowId ||
+                        !["completed", "partial"].includes(proposal.status) ||
+                        proposal.validated !== false ||
+                        proposal.applied !== false ||
+                        proposal.staticPreflight?.status !== "eligible-for-sandbox-review") {
+                        state.lastErrorCode = "sandbox-transfer-recovery-invalid";
+                        setTerminalState(state, "halted", "sandbox-transfer-recovery-invalid", now);
+                        return {
+                            ...state,
+                            message: "The persisted transfer result did not match an eligible proposal; the run was halted."
+                        };
+                    }
+                    completeProposalCycle(state, proposal.status, now);
+                    return {
+                        ...state,
+                        proposalArtifact: proposalArtifactName,
+                        message: "Recovered the persisted non-executing transfer result without repeating the transfer; the proposal remains unvalidated and unapplied."
+                    };
+                }
+                state.lastErrorCode = "sandbox-transfer-interrupted";
+                setTerminalState(state, "halted", "sandbox-transfer-interrupted", now);
+                return {
+                    ...state,
+                    message: "A prior sandbox transfer was interrupted; the run halted without retrying it. Candidate code was not executed."
+                };
             }
 
             if (state.phase === "polling") {
@@ -1195,6 +1368,7 @@ function createImprovementLoop(options = {}) {
                     }
                     state[`${state.cycleStage}ArtifactHash`] = artifactMetadata.hash;
                     state[`${state.cycleStage}ArtifactBytes`] = artifactMetadata.bytes;
+                    if (state.cycleStage === "proposal") state.sandboxTransfer = null;
                     state.pendingProviderCalls = 0;
                     state.workflowId = null;
                     state.pollDeadlineAt = null;
@@ -1230,26 +1404,63 @@ function createImprovementLoop(options = {}) {
                             message: `Proposal was stored but rejected by static preflight (${artifact.staticPreflight.reasonCode}); it remains unapplied and unvalidated.`
                         };
                     }
-                    state.lastCycleOutcome = response.data.status;
-                    state.usage.cycles += 1;
-                    state.cycleStage = "advice";
-                    if (authorizationExpired) {
-                        setTerminalState(state, "expired", "authorization-window-ended", now);
-                    } else if (state.usage.cycles >= state.authorization.maxCycles) {
-                        setTerminalState(state, "completed", "cycle-budget-exhausted", now);
-                    } else if (state.usage.providerCalls + state.authorization.providers.length + 3 >
-                        state.authorization.maxProviderCalls) {
-                        setTerminalState(state, "completed", "provider-budget-exhausted", now);
-                    } else {
-                        state.workspaceBase = null;
-                        state.phase = "context";
+                    if (state.authorization.sandboxTransferAuthorizedAt) {
+                        if (fileExists(pathsValue.stop)) {
+                            setTerminalState(state, "stopped", "user-request", now);
+                            return {
+                                ...state,
+                                proposalArtifact: proposalArtifactName,
+                                message: "Stopped before sandbox transfer; the eligible proposal remains unapplied and unvalidated."
+                            };
+                        }
+                        state.sandboxTransfer = null;
+                        state.phase = "sandboxing";
                         state.updatedAt = now.toISOString();
                         writeState(pathsValue.state, state);
+                        try {
+                            const attestation = executeSandboxTransfer(artifact);
+                            now = currentTime();
+                            state.sandboxTransfer = {
+                                ...attestation,
+                                proposalArtifactHash: state.proposalArtifactHash,
+                                proposalWorkflowId: artifact.workflowId
+                            };
+                            try {
+                                writeState(pathsValue.state, state);
+                            } catch (error) {
+                                state.sandboxTransfer = null;
+                                throw error;
+                            }
+                        } catch (error) {
+                            now = currentTime();
+                            state.lastCycleOutcome = "failed";
+                            state.lastErrorCode = error instanceof StateFileError
+                                ? "sandbox-attestation-persist-failed"
+                                : error.code || "sandbox-transfer-failed";
+                            setTerminalState(state, "halted", "sandbox-transfer-failed", now);
+                            return {
+                                ...state,
+                                proposalArtifact: proposalArtifactName,
+                                ...(error.cleanupError ? { sandboxCleanupError: error.cleanupError } : {}),
+                                message: "Sandbox transfer failed; the run halted. The proposal remains unvalidated and unapplied."
+                            };
+                        }
+                        if (fileExists(pathsValue.stop)) {
+                            setTerminalState(state, "stopped", "user-request", now);
+                            return {
+                                ...state,
+                                proposalArtifact: proposalArtifactName,
+                                message: "Stopped after the non-executing sandbox transfer; the proposal remains unvalidated and unapplied."
+                            };
+                        }
                     }
+                    completeProposalCycle(state, response.data.status, now);
                     return {
                         ...state,
                         proposalArtifact: proposalArtifactName,
-                        message: `Proposal for cycle ${state.usage.cycles} passed static preflight only; it has not been validated or applied.`
+                        message: state.sandboxTransfer
+                            ? `Proposal for cycle ${state.usage.cycles} passed static preflight and staged-byte transfer only; it has not been validated or applied.`
+                            : `Proposal for cycle ${state.usage.cycles} passed static preflight only; it has not been validated or applied.`
                     };
                 }
 
@@ -1593,6 +1804,8 @@ function parseArguments(args) {
         const value = values[index];
         if (value === "--confirm-provider-sharing") {
             configuration.confirmedProviderSharing = true;
+        } else if (value === "--confirm-sandbox-transfer") {
+            configuration.confirmedSandboxTransfer = true;
         } else {
             const flags = {
                 "--providers": "providers",
@@ -1632,7 +1845,7 @@ async function main(args = process.argv.slice(2)) {
     if (parsed.command === "sandbox-probe") {
         console.log("Sandbox transfer only; candidate code was not executed, validated, or applied.");
     } else {
-        console.log(`Cycle execution: ${cycleExecution}. Proposals are untrusted and not applied; no commands were executed.`);
+        console.log(`Cycle execution: ${cycleExecution}. Proposal code is never executed or applied; authorized sandbox transfers only verify staged-byte hashes.`);
         console.log(`Budgets: ${result.authorization
             ? `${result.usage.providerCalls}/${result.authorization.maxProviderCalls} provider calls reserved; searches remain unused`
             : "not configured"}.`);
